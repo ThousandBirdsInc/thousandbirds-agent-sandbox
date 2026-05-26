@@ -1,0 +1,22 @@
+[package]
+name = "thousandbirds-agent-sandbox"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.0"
+license = "Apache-2.0"
+
+[dependencies]
+async-trait = "0.1"
+libc = "0.2"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
+webpki-roots = "1"
+
+[lib]
+name = "thousandbirds_agent_sandbox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tb-sandbox"
+path = "src/main.rs"

@@ -1,0 +1,158 @@
+#!/bin/sh
+set -eu
+
+mkdir -p /run/agent-sandbox/config /run/agent-sandbox/credentials
+
+mountpoint -q /run/agent-sandbox/config ||
+  mount -t virtiofs agent-config /run/agent-sandbox/config
+
+mkdir -p /run/agent-sandbox/control
+mountpoint -q /run/agent-sandbox/control ||
+  mount -t virtiofs agent-control /run/agent-sandbox/control 2>/dev/null || true
+chmod 0777 /run/agent-sandbox/control 2>/dev/null || true
+
+if [ -f /run/agent-sandbox/config/mounts.tsv ]; then
+  while IFS='	' read -r tag guest_path read_only; do
+    [ -n "${tag:-}" ] || continue
+    [ -n "${guest_path:-}" ] || continue
+    mkdir -p "$guest_path"
+    mountpoint -q "$guest_path" ||
+      mount -t virtiofs "$tag" "$guest_path" 2>/dev/null || true
+  done < /run/agent-sandbox/config/mounts.tsv
+else
+  mkdir -p /workspace
+  mountpoint -q /workspace ||
+    mount -t virtiofs workspace /workspace 2>/dev/null || true
+fi
+
+mountpoint -q /run/agent-sandbox/credentials ||
+  mount -t virtiofs agent-credentials /run/agent-sandbox/credentials 2>/dev/null || true
+
+if [ -f /run/agent-sandbox/config/shell.env ]; then
+  . /run/agent-sandbox/config/shell.env
+fi
+if [ -f /run/agent-sandbox/config/terminal.env ]; then
+  . /run/agent-sandbox/config/terminal.env
+fi
+if [ -f /run/agent-sandbox/config/proxy.env ]; then
+  . /run/agent-sandbox/config/proxy.env
+fi
+
+# Emit a startup phase marker with the guest's monotonic uptime (seconds since
+# kernel boot) when profiling is enabled. scripts/profile-sandbox.sh uses these
+# to split host pre-kernel time from in-guest boot time.
+prof() {
+  [ -n "${AGENT_SANDBOX_PROFILE:-}" ] || return 0
+  printf 'tb-sandbox-profile guest_%s=%s\n' "$1" "$(cut -d' ' -f1 /proc/uptime 2>/dev/null || echo 0)"
+}
+prof shell_start
+
+MITM_CA_SOURCE="${AGENT_SANDBOX_MITM_CA:-/run/agent-sandbox/config/mitm-ca.pem}"
+MITM_CA_DEST="/usr/local/share/ca-certificates/agent-sandbox-mitm-ca.crt"
+if [ -s "$MITM_CA_SOURCE" ]; then
+  cp "$MITM_CA_SOURCE" "$MITM_CA_DEST" 2>/dev/null || true
+  chmod 0644 "$MITM_CA_DEST" 2>/dev/null || true
+  update-ca-certificates >/dev/null 2>&1 || true
+fi
+
+if [ "${AGENT_SANDBOX_DHCP:-0}" = "1" ]; then
+  for mod in failover net_failover af_packet virtio_net; do
+    modprobe "$mod" 2>/dev/null || true
+  done
+  iface="${AGENT_SANDBOX_NET_IFACE:-}"
+  if [ -z "$iface" ]; then
+    for net_path in /sys/class/net/*; do
+      name="${net_path##*/}"
+      if [ "$name" != "lo" ]; then
+        iface="$name"
+        break
+      fi
+    done
+  fi
+  if [ -n "$iface" ]; then
+    ip link set "$iface" up 2>/dev/null || true
+    udhcpc -i "$iface" -q -t 5 2>/dev/null || true
+    if ! ip -4 addr show dev "$iface" 2>/dev/null | grep -q 'inet '; then
+      case "${AGENT_SANDBOX_NET_STATIC:-}" in
+        gvproxy)
+          ip addr add 192.168.127.2/24 dev "$iface" 2>/dev/null || true
+          ip route replace default via 192.168.127.1 dev "$iface" 2>/dev/null || true
+          if [ ! -s /etc/resolv.conf ]; then
+            printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf 2>/dev/null || true
+          fi
+          ;;
+      esac
+    fi
+  fi
+fi
+
+SANDBOX_NAME="${SANDBOX_NAME:-sandbox}"
+GUEST_USER="${GUEST_USER:-agent}"
+WORKSPACE="${WORKSPACE:-/workspace}"
+SHELL_PATH="${SHELL_PATH:-/bin/bash}"
+INITIAL_COMMAND="${INITIAL_COMMAND:-}"
+SERIAL_TTY="${SERIAL_TTY:-$(tty 2>/dev/null || printf /dev/console)}"
+
+if ! grep -Eq '(^|[[:space:]])localhost($|[[:space:]])' /etc/hosts 2>/dev/null; then
+  {
+    printf '127.0.0.1 localhost\n'
+    printf '::1 localhost ip6-localhost ip6-loopback\n'
+  } >> /etc/hosts 2>/dev/null || true
+fi
+
+prof pre_credentials
+# Only run credential import when something was actually staged. Skipping it on
+# credential-less boots avoids a recursive chown over the agent home (which holds
+# the npm-global agent tooling) on every start.
+if find /run/agent-sandbox/credentials -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
+  /usr/local/bin/agent-sandbox-import-credentials /run/agent-sandbox/credentials "$GUEST_USER"
+fi
+prof post_credentials
+
+HOME_DIR="$(getent passwd "$GUEST_USER" | cut -d: -f6)"
+SESSION_SCRIPT="/tmp/agent-sandbox-session-$$.sh"
+cat > "$SESSION_SCRIPT" <<EOF
+#!/bin/sh
+cd '$(printf "%s" "$WORKSPACE" | sed "s/'/'\\\\''/g")'
+if [ -f "\$HOME/.agent-sandbox-env" ]; then
+  . "\$HOME/.agent-sandbox-env"
+fi
+if [ -f /run/agent-sandbox/config/proxy.env ]; then
+  . /run/agent-sandbox/config/proxy.env
+fi
+if [ -f /run/agent-sandbox/config/terminal.env ]; then
+  . /run/agent-sandbox/config/terminal.env
+fi
+if command -v stty >/dev/null 2>&1; then
+  if [ -n "\${AGENT_SANDBOX_TTY_ROWS:-}" ] && [ -n "\${AGENT_SANDBOX_TTY_COLS:-}" ]; then
+    stty rows "\$AGENT_SANDBOX_TTY_ROWS" cols "\$AGENT_SANDBOX_TTY_COLS" 2>/dev/null || true
+  else
+    set -- \$(stty size 2>/dev/null || printf '0 0')
+    if [ "\${1:-0}" = "0" ] || [ "\${2:-0}" = "0" ]; then
+    stty rows 24 cols 80 2>/dev/null || true
+    fi
+  fi
+fi
+export PS1='[sandbox:$(printf "%s" "$SANDBOX_NAME" | sed "s/'/'\\\\''/g") \w]\$ '
+if [ -n '$(printf "%s" "$INITIAL_COMMAND" | sed "s/'/'\\\\''/g")' ]; then
+  :
+  $(printf "%s" "$INITIAL_COMMAND")
+fi
+exec '$(printf "%s" "$SHELL_PATH" | sed "s/'/'\\\\''/g")' -l
+EOF
+chmod 700 "$SESSION_SCRIPT"
+chown "$GUEST_USER:$GUEST_USER" "$SESSION_SCRIPT"
+
+cd "$HOME_DIR"
+prof session_exec
+set +e
+if command -v agent-sandbox-login-tty >/dev/null 2>&1; then
+  agent-sandbox-login-tty "$SERIAL_TTY" "$GUEST_USER" "$SESSION_SCRIPT"
+else
+  su - "$GUEST_USER" -c "$SESSION_SCRIPT"
+fi
+status=$?
+set -e
+
+systemctl poweroff 2>/dev/null || poweroff -f 2>/dev/null || true
+exit "$status"

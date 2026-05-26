@@ -1,0 +1,25 @@
+# Cargo build output and generated sandbox artifacts.
+/target/
+
+# Local runtime state, caches, and profiling outputs.
+*.log
+*.pid
+*.prof
+*.trace
+*.tmp
+*.swp
+
+# Environment and machine-local configuration.
+.env
+.env.*
+!.env.example
+
+# Editor and OS metadata.
+.DS_Store
+._*
+.vscode/
+.idea/
+
+# Rust tooling scratch files.
+*.rs.bk
+*.pdb

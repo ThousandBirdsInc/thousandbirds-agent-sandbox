@@ -1,0 +1,18 @@
+[Unit]
+Description=Thousand Birds Agent Sandbox Shell
+After=local-fs.target
+Before=getty.target
+Conflicts=console-getty.service getty@tty1.service serial-getty@ttyAMA0.service serial-getty@ttyS0.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/agent-sandbox-shell
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=@SERIAL_TTY@
+TTYReset=yes
+TTYVHangup=yes
+
+[Install]
+WantedBy=multi-user.target
