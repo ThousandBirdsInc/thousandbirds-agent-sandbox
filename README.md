@@ -454,6 +454,81 @@ cargo run -- inspect my-sandbox
 cargo run -- delete my-sandbox
 ```
 
+`list` reports each sandbox's run state and the host memory it reserves while
+running:
+
+```text
+my-sandbox	running	2048MiB	/path/to/state/sandboxes/my-sandbox	/path/to/image
+other   	stopped	-      	/path/to/state/sandboxes/other      	/path/to/image
+```
+
+## Run Many Sandboxes (Density)
+
+Two host-side controls keep many concurrent sandboxes within a machine's
+resources. See
+[docs/vm-density-and-resource-sharing-design.md](docs/vm-density-and-resource-sharing-design.md)
+for the full design.
+
+**Memory admission control.** Each running VM reserves its initial memory
+(`--memory-mib`) against a host budget. Starting a VM that would exceed the
+budget is refused (or queued), so you can pack sandboxes without swapping the
+host. Reservations are released automatically when a VM exits (markers are
+self-reaping if a VM crashes).
+
+```sh
+# Cap total sandbox memory at 24 GiB; refuse starts beyond it (the default).
+TB_SANDBOX_MEM_BUDGET_MIB=24576 cargo run -- start my-sandbox
+
+# Or wait for capacity instead of failing.
+TB_SANDBOX_MEM_BUDGET_MIB=24576 TB_SANDBOX_ADMISSION=queue cargo run -- start my-sandbox
+```
+
+The budget defaults to 80% of physical RAM; set `TB_SANDBOX_MEM_BUDGET_MIB=0` to
+disable admission control entirely.
+
+**Shared read-only mounts.** Point many sandboxes at the same host directory
+read-only — toolchains, package caches, model assets — so they share its
+contents instead of each baking a private copy into its root disk. Unlike
+`--mount`, a `--shared-mount` is read-only in the guest, so one sandbox cannot
+mutate another's view.
+
+```sh
+cargo run -- shell \
+  --image target/agent-images/debian-bookworm \
+  --workspace . \
+  --shared-mount toolchains=/opt/host-toolchains \
+  --shared-mount npm-cache=/Users/me/.npm:/home/agent/.npm
+```
+
+A `--shared-mount` defaults to guest path `/mnt/shared/<TAG>` when no
+`:GUEST_PATH` is given.
+
+**Shared host page cache (virtio-fs DAX).** Add `--virtiofs-dax-size SIZE`
+(e.g. `--virtiofs-dax-size 1G`) to open a DAX window. Guests then map virtio-fs
+files directly from the host page cache instead of copying them into guest RAM,
+so multiple sandboxes mounting the same read-only directory share those physical
+pages. Requires a guest kernel built with `CONFIG_FUSE_DAX` (see
+[the libkrun guest image notes](../thousandbirds-libkrun/design_docs/os_mode_guest_image.md)).
+
+**Automatic memory reclaim (virtio-balloon free-page reporting).** A guest kernel
+built with `CONFIG_VIRTIO_BALLOON=y` and `CONFIG_PAGE_REPORTING=y` returns its
+freed pages to the host automatically, so a long-lived VM's host memory tracks
+its live working set instead of its peak. libkrun already attaches the balloon
+and frees reported pages; this needs only the guest kernel options. It is
+independent of the opt-in runtime [resize](#resize-memory-at-runtime) path.
+
+**Warm pool (library API).** Embedders running a long-lived `SandboxManagerSdk`
+can keep a pool of pre-booted sandboxes so new sessions skip cold boot:
+
+```rust
+let pool = WarmPool::new(sdk.clone(), template_config, 4);
+pool.prewarm().await?;          // boot 4 sandboxes up front
+let id = pool.acquire().await?; // hand one out; pool refills in the background
+```
+
+Pooled sandboxes share the template's mounts and are still subject to the memory
+budget above.
+
 Use an ephemeral sandbox that is deleted after the VM exits:
 
 ```sh
@@ -640,11 +715,14 @@ host create/prelaunch  ~5 ms        APFS copy-on-write clone of the root disk
 
 Tuned defaults and what moves the numbers (from A/B sweeps):
 
-- **`--cpus 2` and `--memory-mib 2048` are the defaults and the sweet spot.**
-  Raising memory *hurts* startup (~+100 ms at 4096 MiB, from zeroing more guest
-  RAM); lowering it to 512 MiB does not help. 1 CPU costs ~60 ms of guest boot
-  (less parallel systemd); 4 CPUs does not beat 2. Workspace/credential mount
-  count has no measurable effect on startup.
+- **`--memory-mib 2048` is the default and the startup sweet spot.** Raising
+  memory *hurts* startup (~+100 ms at 4096 MiB, from zeroing more guest RAM);
+  lowering it to 512 MiB does not help. Workspace/credential mount count has no
+  measurable effect on startup.
+- **`--cpus` defaults to 1** for VM density (vCPUs are host threads). A second
+  CPU shaves ~60 ms off guest boot (more parallel systemd) and 4 CPUs does not
+  beat 2, so pass `--cpus 2` when you want the fastest boot or run parallel
+  builds. See [docs/vm-density-and-resource-sharing-design.md](docs/vm-density-and-resource-sharing-design.md).
 - **The host create step is effectively free** because the root disk is cloned
   with an APFS copy-on-write `cp -c`. Cold-cache first boots after an image
   rebuild show higher `pre-kernel VMM init`; it settles once the disk is warm.

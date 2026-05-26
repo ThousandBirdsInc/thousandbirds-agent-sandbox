@@ -43,9 +43,16 @@ pub fn run(args: Vec<String>) -> Result<()> {
         }
         "list" => {
             for summary in manager.list()? {
+                let state = if summary.running { "running" } else { "stopped" };
+                let reserved = summary
+                    .reserved_mib
+                    .map(|mib| format!("{mib}MiB"))
+                    .unwrap_or_else(|| "-".to_string());
                 println!(
-                    "{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}",
                     summary.id,
+                    state,
+                    reserved,
                     summary.state_dir.display(),
                     summary.image_path.display()
                 );
@@ -194,10 +201,12 @@ fn run_exec(id: SandboxId, command: GuestCommand) -> Result<()> {
 fn parse_sandbox_config(args: Vec<String>, shell_command: bool) -> Result<SandboxConfig> {
     let mut image = env::var_os("TB_SANDBOX_IMAGE").map(PathBuf::from);
     let mut name = None;
-    let mut cpus = 2u8;
+    // Density-aware default: 1 vCPU (see SandboxConfig::new / design doc #G).
+    let mut cpus = 1u8;
     let mut memory_mib = 2048u32;
     let mut memory_max_mib: Option<u32> = None;
     let mut memory_min_mib = 512u32;
+    let mut virtiofs_dax_size = 0u64;
     let mut workspace_mounts = Vec::new();
     let mut credential_profiles = Vec::new();
     let mut extra_credentials = Vec::new();
@@ -266,6 +275,16 @@ fn parse_sandbox_config(args: Vec<String>, shell_command: bool) -> Result<Sandbo
             }
             "--mount" => {
                 workspace_mounts.push(parse_mount(&next_value(&mut iter, "--mount")?)?);
+            }
+            "--shared-mount" => {
+                workspace_mounts.push(parse_shared_mount(&next_value(
+                    &mut iter,
+                    "--shared-mount",
+                )?)?);
+            }
+            "--virtiofs-dax-size" => {
+                virtiofs_dax_size =
+                    parse_size_bytes(&next_value(&mut iter, "--virtiofs-dax-size")?)?;
             }
             "--credentials" => {
                 let value = next_value(&mut iter, "--credentials")?;
@@ -396,6 +415,7 @@ fn parse_sandbox_config(args: Vec<String>, shell_command: bool) -> Result<Sandbo
     config.memory_mib = memory_mib;
     config.memory_max_mib = memory_max_mib;
     config.memory_min_mib = memory_min_mib;
+    config.virtiofs_dax_size = virtiofs_dax_size;
     config.workspace_mounts = workspace_mounts;
     config.credential_profiles = credential_profiles;
     config.extra_credentials = extra_credentials;
@@ -449,6 +469,49 @@ fn parse_mount(value: &str) -> Result<WorkspaceMount> {
         guest_path: guest.to_string(),
         read_only: false,
     })
+}
+
+/// Parse a read-only shared-asset mount: `TAG=HOST_PATH[:GUEST_PATH]`. Unlike
+/// `--mount`, the guest sees this read-only, so many sandboxes can point at the
+/// same host directory (toolchains, package caches, model assets) and share its
+/// pages without one VM mutating another's view. Guest path defaults to
+/// `/mnt/shared/<TAG>` when omitted.
+fn parse_shared_mount(value: &str) -> Result<WorkspaceMount> {
+    let (tag, rest) = value.split_once('=').ok_or_else(|| {
+        Error::InvalidArgument("--shared-mount must use TAG=HOST_PATH[:GUEST_PATH]".to_string())
+    })?;
+    if tag.is_empty() {
+        return Err(Error::InvalidArgument(
+            "shared mount tag must not be empty".to_string(),
+        ));
+    }
+    let (host, guest) = match rest.rsplit_once(':') {
+        Some((host, guest)) if guest.starts_with('/') => (host.to_string(), guest.to_string()),
+        _ => (rest.to_string(), format!("/mnt/shared/{tag}")),
+    };
+    Ok(WorkspaceMount {
+        tag: tag.to_string(),
+        host_path: canonicalize_existing(&PathBuf::from(host))?,
+        guest_path: guest,
+        read_only: true,
+    })
+}
+
+/// Parse a byte size that optionally ends in a K/M/G (base-1024) suffix, e.g.
+/// `1073741824`, `1024M`, or `1G`.
+fn parse_size_bytes(value: &str) -> Result<u64> {
+    let trimmed = value.trim();
+    let (number, multiplier) = match trimmed.chars().last() {
+        Some('K' | 'k') => (&trimmed[..trimmed.len() - 1], 1024u64),
+        Some('M' | 'm') => (&trimmed[..trimmed.len() - 1], 1024 * 1024),
+        Some('G' | 'g') => (&trimmed[..trimmed.len() - 1], 1024 * 1024 * 1024),
+        _ => (trimmed, 1),
+    };
+    let base: u64 = number.trim().parse().map_err(|_| {
+        Error::InvalidArgument(format!("invalid byte size {value}; use bytes or a K/M/G suffix"))
+    })?;
+    base.checked_mul(multiplier)
+        .ok_or_else(|| Error::InvalidArgument(format!("byte size {value} overflows")))
 }
 
 fn parse_credential_path(value: &str) -> Result<CredentialSpec> {
@@ -535,12 +598,14 @@ Usage:
 Common options:
   --image PATH_OR_REF
   --name NAME
-  --cpus N
+  --cpus N                  vCPUs (default 1)
   --memory-mib N            Initial guest memory (MiB)
   --memory-max-mib N        Resize ceiling (MiB); enables runtime resizing when > --memory-mib
   --memory-min-mib N        Floor for runtime memory reclaim (MiB, default 512)
   --workspace PATH
-  --mount TAG=HOST_PATH[:GUEST_PATH]
+  --mount TAG=HOST_PATH[:GUEST_PATH]          Read-write workspace mount
+  --shared-mount TAG=HOST_PATH[:GUEST_PATH]   Read-only mount shared across sandboxes
+  --virtiofs-dax-size BYTES   DAX window (e.g. 1G) so shared mounts share host page cache
   --credentials none|claude|codex|git|PROFILE[,PROFILE...]
   --credential-path HOST_PATH:GUEST_RELATIVE_PATH
   --credential-env NAME
@@ -556,6 +621,11 @@ Common options:
   --initial-command COMMAND
   --yes
   --log-level error|warn|info|debug|trace
+
+Host memory admission control (env):
+  TB_SANDBOX_MEM_BUDGET_MIB N      Host memory budget; 0 disables (default 80% of RAM)
+  TB_SANDBOX_ADMISSION reject|queue  Behavior when the budget is full (default reject)
+  TB_SANDBOX_ADMISSION_TIMEOUT_SECS N  Max wait under `queue` (default 300)
 "
     );
 }

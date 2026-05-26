@@ -6,6 +6,7 @@ pub mod image;
 pub mod libkrun;
 pub mod proxy;
 pub mod runtime;
+pub mod scheduler;
 pub mod sdk;
 
 pub use config::{
@@ -15,7 +16,9 @@ pub use config::{
 pub use error::{Error, Result};
 pub use image::AgentImage;
 pub use runtime::{Sandbox, SandboxId, SandboxManager, SandboxSummary, WorkspaceMountInfo};
+pub use runtime::MemoryLimits;
+pub use scheduler::{AdmissionPolicy, ResourceLedger};
 pub use sdk::{
-    GuestCommand, GuestExitStatus, GuestProcess, LocalProcessSandboxRuntime, PortForward,
-    SandboxManagerSdk, SandboxRuntimeSdk,
+    GuestCommand, GuestExitStatus, GuestProcess, IdleReclaimConfig, LocalProcessSandboxRuntime,
+    PortForward, SandboxManagerSdk, SandboxRuntimeSdk, WarmPool,
 };

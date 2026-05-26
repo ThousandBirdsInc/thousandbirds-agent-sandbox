@@ -23,6 +23,9 @@ pub enum Error {
         operation: &'static str,
         code: i32,
     },
+    /// Admission control refused to start a sandbox because doing so would
+    /// exceed the configured host memory budget.
+    ResourceExhausted(String),
     /// An internal failure that is not the caller's fault, e.g. a background
     /// task panicked or could not be joined.
     Internal(String),
@@ -65,6 +68,7 @@ impl fmt::Display for Error {
             Error::Libkrun { operation, code } => {
                 write!(f, "{operation} failed with libkrun error {code}")
             }
+            Error::ResourceExhausted(message) => write!(f, "resource exhausted: {message}"),
             Error::Internal(message) => write!(f, "internal error: {message}"),
         }
     }

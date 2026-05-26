@@ -4,8 +4,9 @@ use crate::config::{
 use crate::credentials::{prepare_credentials, PreparedCredentials};
 use crate::error::{Error, Result};
 use crate::image::{json_bool, json_number, json_string, json_string_array, AgentImage};
-use crate::libkrun::{launch, launch_command, LaunchConfig};
+use crate::libkrun::{launch_command, LaunchConfig};
 use crate::proxy::NetworkProxy;
+use crate::scheduler::ResourceLedger;
 use std::env;
 use std::fs;
 use std::net::TcpListener;
@@ -55,6 +56,26 @@ pub struct SandboxSummary {
     pub id: SandboxId,
     pub state_dir: PathBuf,
     pub image_path: PathBuf,
+    /// Whether the sandbox currently has a live VM (running marker present).
+    pub running: bool,
+    /// MiB this sandbox reserves against the host memory budget while running.
+    pub reserved_mib: Option<u64>,
+}
+
+/// A sandbox's configured memory limits, in MiB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryLimits {
+    pub initial_mib: u32,
+    pub max_mib: u32,
+    pub min_mib: u32,
+}
+
+impl MemoryLimits {
+    /// Runtime memory resizing is enabled when the ceiling exceeds the initial
+    /// memory, leaving headroom the balloon can grow into.
+    pub fn resize_enabled(&self) -> bool {
+        self.max_mib > self.initial_mib
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +95,9 @@ pub struct SandboxManager {
 pub struct RunningSandboxLaunch {
     child: Option<Child>,
     pub control_socket: PathBuf,
+    /// Directory whose running reservation marker is released when this launch
+    /// handle is dropped (i.e. after the VM process exits and the SDK drops it).
+    running_marker_dir: Option<PathBuf>,
     _managed_gvproxy: Option<ManagedGvproxy>,
     _proxy: Option<NetworkProxy>,
 }
@@ -86,6 +110,14 @@ impl RunningSandboxLaunch {
     }
 }
 
+impl Drop for RunningSandboxLaunch {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.running_marker_dir {
+            ResourceLedger::clear_running(dir);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct StoredSandbox {
     id: SandboxId,
@@ -95,6 +127,7 @@ struct StoredSandbox {
     memory_mib: u32,
     memory_max_mib: u32,
     memory_min_mib: u32,
+    virtiofs_dax_size: u64,
     workspace_mounts: Vec<WorkspaceMount>,
     credentials_staging: Option<PathBuf>,
     runtime_config: PathBuf,
@@ -255,6 +288,7 @@ impl SandboxManager {
             memory_mib: config.memory_mib,
             memory_max_mib: config.memory_max_mib,
             memory_min_mib: config.memory_min_mib,
+            virtiofs_dax_size: config.virtiofs_dax_size,
             workspace_mounts: config.workspace_mounts.clone(),
             credentials_staging,
             runtime_config,
@@ -274,6 +308,10 @@ impl SandboxManager {
 
     pub fn shell(&self, id: &SandboxId) -> Result<()> {
         let stored = self.load(id)?;
+        // Admission control: refuse (or queue) if starting this VM would exceed
+        // the host memory budget. Done before any gvproxy/proxy side effects.
+        ResourceLedger::from_env(&self.state_root)
+            .admit(id.as_str(), stored.memory_mib as u64)?;
         let image = AgentImage::load(&stored.image_path)?;
         write_terminal_env(&stored.runtime_config)?;
         let managed_gvproxy = match &stored.network_backend {
@@ -324,7 +362,10 @@ impl SandboxManager {
         } else {
             None
         };
-        launch(LaunchConfig {
+        // Build the launcher command and run it ourselves (rather than the
+        // fire-and-forget `launch` helper) so we can record the VM process PID in
+        // the running reservation marker and release it once the VM exits.
+        let mut command = launch_command(LaunchConfig {
             image: &image,
             root_disk: &stored.root_disk,
             cpus: stored.cpus,
@@ -332,6 +373,7 @@ impl SandboxManager {
             memory_max_mib: stored.memory_max_mib,
             memory_min_mib: stored.memory_min_mib,
             control_socket: control_socket_arg,
+            virtiofs_dax_size: stored.virtiofs_dax_size,
             workspace_mounts: &stored.workspace_mounts,
             credentials_mount: stored.credentials_staging.as_deref(),
             runtime_config_mount: &stored.runtime_config,
@@ -339,6 +381,21 @@ impl SandboxManager {
             network_backend: &launch_network_backend,
             log_level: stored.log_level,
         })?;
+        command
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        let sandbox_dir = self.sandbox_dir(id);
+        let mut child = command.spawn().map_err(Error::io)?;
+        let ledger = ResourceLedger::from_env(&self.state_root);
+        let _ = ledger.record_running(
+            &sandbox_dir,
+            id.as_str(),
+            child.id(),
+            stored.memory_mib as u64,
+        );
+        let status = child.wait().map_err(Error::io)?;
+        ResourceLedger::clear_running(&sandbox_dir);
         // The VMM removes the socket on exit; clean up defensively.
         let _ = fs::remove_file(&control_socket);
         drop(proxy);
@@ -346,11 +403,19 @@ impl SandboxManager {
         if stored.ephemeral {
             self.delete(id)?;
         }
+        if !status.success() {
+            return Err(Error::ProcessFailed {
+                command: "libkrun os_mode launcher".to_string(),
+                status,
+            });
+        }
         Ok(())
     }
 
     pub fn launch_piped(&self, id: &SandboxId) -> Result<RunningSandboxLaunch> {
         let stored = self.load(id)?;
+        ResourceLedger::from_env(&self.state_root)
+            .admit(id.as_str(), stored.memory_mib as u64)?;
         let image = AgentImage::load(&stored.image_path)?;
         write_terminal_env(&stored.runtime_config)?;
         let managed_gvproxy = match &stored.network_backend {
@@ -391,6 +456,7 @@ impl SandboxManager {
             memory_max_mib: stored.memory_max_mib,
             memory_min_mib: stored.memory_min_mib,
             control_socket: control_socket_arg,
+            virtiofs_dax_size: stored.virtiofs_dax_size,
             workspace_mounts: &stored.workspace_mounts,
             credentials_mount: stored.credentials_staging.as_deref(),
             runtime_config_mount: &stored.runtime_config,
@@ -412,9 +478,18 @@ impl SandboxManager {
             command.process_group(0);
         }
         let child = command.spawn().map_err(Error::io)?;
+        let sandbox_dir = self.sandbox_dir(id);
+        let ledger = ResourceLedger::from_env(&self.state_root);
+        let _ = ledger.record_running(
+            &sandbox_dir,
+            id.as_str(),
+            child.id(),
+            stored.memory_mib as u64,
+        );
         Ok(RunningSandboxLaunch {
             child: Some(child),
             control_socket,
+            running_marker_dir: Some(sandbox_dir),
             _managed_gvproxy: managed_gvproxy,
             _proxy: proxy,
         })
@@ -513,6 +588,22 @@ impl SandboxManager {
         self.sandbox_dir(id).join("control.sock")
     }
 
+    /// The sandbox's configured memory limits. Used by background reclaim to
+    /// decide whether a VM has resize headroom and what floor to shrink to.
+    pub fn memory_limits(&self, id: &SandboxId) -> Result<MemoryLimits> {
+        let stored = self.load(id)?;
+        Ok(MemoryLimits {
+            initial_mib: stored.memory_mib,
+            max_mib: stored.memory_max_mib,
+            min_mib: stored.memory_min_mib,
+        })
+    }
+
+    /// Whether the sandbox currently has a live VM process.
+    pub fn is_running(&self, id: &SandboxId) -> bool {
+        ResourceLedger::is_running(&self.sandbox_dir(id))
+    }
+
     pub fn list(&self) -> Result<Vec<SandboxSummary>> {
         let root = self.state_root.join("sandboxes");
         if !root.exists() {
@@ -529,9 +620,13 @@ impl SandboxManager {
                 _ => continue,
             };
             if let Ok(stored) = self.load(&id) {
+                let dir = entry.path();
+                let reserved_mib = ResourceLedger::reserved_for(&dir);
                 summaries.push(SandboxSummary {
                     id,
-                    state_dir: entry.path(),
+                    running: reserved_mib.is_some(),
+                    reserved_mib,
+                    state_dir: dir,
                     image_path: stored.image_path,
                 });
             }
@@ -564,6 +659,7 @@ impl SandboxManager {
                 .map(|v| v as u32)
                 .unwrap_or_else(|| json_number(&json, "memory_mib").unwrap_or(2048) as u32),
             memory_min_mib: json_number(&json, "memory_min_mib").unwrap_or(512) as u32,
+            virtiofs_dax_size: json_number(&json, "virtiofs_dax_size").unwrap_or(0),
             workspace_mounts: parse_mounts(&json)?,
             credentials_staging: json_string(&json, "credentials_staging")
                 .filter(|value| !value.is_empty())
@@ -1088,6 +1184,7 @@ fn write_sandbox_metadata(path: &Path, stored: &StoredSandbox) -> Result<()> {
             "  \"memory_mib\": {},\n",
             "  \"memory_max_mib\": {},\n",
             "  \"memory_min_mib\": {},\n",
+            "  \"virtiofs_dax_size\": {},\n",
             "  \"ephemeral\": {},\n",
             "  \"network_proxy_enabled\": {},\n",
             "  \"network_proxy_tls_mitm\": {},\n",
@@ -1106,6 +1203,7 @@ fn write_sandbox_metadata(path: &Path, stored: &StoredSandbox) -> Result<()> {
         stored.memory_mib,
         stored.memory_max_mib,
         stored.memory_min_mib,
+        stored.virtiofs_dax_size,
         stored.ephemeral,
         stored.network_proxy.enabled,
         stored.network_proxy.tls_mitm,

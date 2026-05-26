@@ -199,9 +199,13 @@ makes it unnecessary. Implement as an opt-in background task in `SandboxManagerS
 Phased so each phase is independently shippable and measurable. Repo-only phases land
 first; libkrun-coupled phases follow.
 
-### Phase 1 — Density safety + cheap sharing (repo only)
+### Phase 1 — Density safety + cheap sharing (repo only) — IMPLEMENTED
 
-Highest value with no libkrun dependency.
+Highest value with no libkrun dependency. Landed in `src/scheduler.rs` (new),
+with wiring in `src/runtime.rs`, `src/cli.rs`, `src/sdk.rs`, `src/config.rs`, and
+`src/error.rs`; documented under "Run Many Sandboxes (Density)" in the README.
+Items 1–4 below are done; the idle auto-reclaim (item 4) is a library opt-in
+(`SandboxManagerSdk::spawn_idle_reclaim`).
 
 1. **Scheduler / admission control (#B).**
    - New `src/scheduler.rs`: `ResourceBudget`, host-memory detection (`sysctl hw.memsize`),
@@ -224,34 +228,100 @@ Highest value with no libkrun dependency.
 refused/queued beyond it; `list` shows live RSS; a shared toolchain mount is read-only in
 the guest and writes never cross VMs.
 
-### Phase 2 — Automatic reclaim (repo + krun, coordinated)
+### Phase 2 — Automatic reclaim (#A) — IMPLEMENTED (guest kernel rebuild pending)
+
+Discovery during implementation: libkrun's virtio-balloon device **already**
+advertises `VIRTIO_BALLOON_F_REPORTING` (`src/devices/.../balloon/device.rs`
+`AVAIL_FEATURES`), its free-page-reporting queue handler already madvise-frees
+reported pages (`process_frq`), and the balloon device is attached to **every**
+VM unconditionally (`src/vmm/src/builder.rs:977`). So no os_mode or wrapper code
+change is needed for reporting — it is gated only by the *guest kernel*.
 
 5. **Free-page reporting (#A).**
-   - **[krun]** guest kernel `CONFIG_PAGE_REPORTING=y`; `os_mode`/libkrun negotiate
-     `VIRTIO_BALLOON_F_REPORTING` + madvise-free; add `--balloon-free-page-reporting`.
-   - **[repo]** always-attach balloon + control socket in `src/libkrun.rs:92-101`; pass the
-     new flag; keep growth gated on headroom.
-   - Update the scheduler (#B) to reserve closer to working set once reclaim is reliable.
+   - **[krun]** Added `CONFIG_VIRTIO_BALLOON=y` + `CONFIG_PAGE_REPORTING=y` to the
+     canonical guest kernel config fragment in
+     `design_docs/os_mode_guest_image.md`, with a note explaining the device-side
+     is already wired. **Remaining external step:** rebuild the guest kernel with
+     these options (cannot be done in this environment).
+   - This is independent of the runtime *resize* path, which already works and is
+     unchanged.
 
 **Exit criteria:** an idle VM's RSS falls back toward its working set within seconds after
-a memory-heavy task; measured via `profile-sandbox.sh` RSS sampling.
+a memory-heavy task; measured via `profile-sandbox.sh` RSS sampling on a kernel built with
+the two options above.
 
-### Phase 3 — Faster boot (krun + repo)
+### Phase 3 — Faster boot (#E) — IMPLEMENTED (guest kernel rebuild pending)
 
-6. **Drop initramfs (#E).** [krun] kernel rebuild; [repo] optional-initramfs in
-   `src/image.rs` / `src/libkrun.rs:87` / image build.
+6. **Drop initramfs (#E).**
+   - **[repo]** `src/image.rs` already treats the initramfs as optional, and
+     `src/libkrun.rs` only passes `--initramfs` when present. Added
+     `NO_INITRAMFS=1` to `scripts/build-agent-image.sh` to emit a direct-boot
+     image (no initramfs file, no `initramfs` key in `image.json`).
+   - **[krun]** The canonical config fragment already lists `CONFIG_VIRTIO_BLK=y`
+     + `CONFIG_EXT4_FS=y` (built-in root drivers). **Remaining external step:**
+     build/ship a guest kernel with those built-in so `/dev/vda` mounts without
+     an initramfs.
 
 **Exit criteria:** cold-boot drops ~345 ms in-guest + the initramfs pre-kernel load in
-`profile-sandbox.sh ITERATIONS=N`.
+`profile-sandbox.sh ITERATIONS=N`, using a `NO_INITRAMFS=1` image on a built-in-driver kernel.
 
-### Phase 4 — Highest-ceiling sharing + scheduling
+### Phase 4 — Highest-ceiling sharing + scheduling — IMPLEMENTED (DAX kernel + on-VM verify pending)
 
-7. **virtiofs DAX (#D).** [krun] DAX window; [repo] opt RO mounts in.
-8. **Warm pool (#F).** [repo] pool manager in `src/sdk.rs` + guest-side bind for late
-   workspace attach; [krun] virtiofs hot-plug / snapshot as the clean follow-on.
+7. **virtiofs DAX (#D).** Discovery: `krun_add_virtiofs3(... shm_size ...)` already
+   exposes a DAX window; os_mode just hard-coded `shm_size=0`.
+   - **[krun]** Added `--virtiofs-dax-size` to `examples/os_mode.c` and route both
+     RO and RW mounts through `krun_add_virtiofs3` with the window size.
+   - **[repo]** Added `SandboxConfig::virtiofs_dax_size`, the `--virtiofs-dax-size`
+     CLI flag (accepts `1G` etc.), persisted in `sandbox.json`, emitted as
+     `--virtiofs-dax-size` from `src/libkrun.rs`. Added `CONFIG_FUSE_DAX=y` (+ deps)
+     to the kernel config fragment. **Remaining external step:** guest kernel with
+     `CONFIG_FUSE_DAX` and an on-VM measurement of shared page cache.
+8. **Warm pool (#F).** [repo] `WarmPool` in `src/sdk.rs`: pre-boots sandboxes from a
+   template config and hands them out via `acquire()`, refilling in the background;
+   admission control still applies per VM. Unit-tested with the fake-launcher harness.
+   Per-session late workspace attach (guest-side bind / virtiofs hot-plug / snapshot)
+   remains the follow-on so the pool can serve arbitrary per-session host directories;
+   today it fits interchangeable sandboxes (shared or no workspace).
 
 **Exit criteria:** shared-mount memory cost is ~flat across VM count (DAX); `create`→ready
 served from the warm pool is dramatically faster than cold.
+
+### On-VM verification results (real guest boot)
+
+Verified by booting a real OS-mode Debian aarch64 guest on this macOS/HVF host with the
+prebuilt libkrunfw 6.12.87 kernel — whose `.config` already has `CONFIG_PAGE_REPORTING`,
+`CONFIG_VIRTIO_BALLOON`, built-in `CONFIG_VIRTIO_BLK`/`CONFIG_EXT4_FS`, and
+`CONFIG_FUSE_DAX`/`CONFIG_VIRTIO_FS`/`CONFIG_DAX` all `=y`. The os_mode launcher
+(with the `--virtiofs-dax-size` change) compiles, links, and runs against the
+freshly built `libkrun.dylib`.
+
+- **#E direct boot (no initramfs): PASS.** Booting with no `--initramfs` reached
+  `KRUN_OSMODE: ready` in ~1.7 s with `EXT4-fs (vda)` mounted directly from `/dev/vda`.
+- **#D virtio-fs DAX: PASS.** `--virtiofs-dax-size $((512*1024*1024))` produced a guest
+  dmesg line `virtiofs virtio3: Cache len: 0x20000000` (exactly the 512 MiB window), and
+  the read-only mount read back its shared file end-to-end.
+- **#A free-page reporting: pipeline verified; macOS host reclaim needs an HVF unmap.**
+  With libkrun DEBUG logging, the guest kernel reported freed pages and the host
+  balloon free-page-reporting handler fired (`process_frq`, 719 × 4 MiB descriptors),
+  i.e. `CONFIG_PAGE_REPORTING` works and the device handler runs. While verifying, found
+  and fixed a real macOS bug: the handler used `madvise(MADV_DONTNEED)`, which is a no-op
+  for anonymous memory on macOS; switched to `MADV_FREE_REUSABLE`
+  (`src/devices/src/virtio/balloon/device.rs`, gated `#[cfg(target_os = "macos")]`), which
+  a standalone test confirms reclaims anon memory (513 → 1 MiB). On **Linux/KVM** this
+  path reclaims. On **macOS/HVF**, host RSS still does not drop because all guest RAM is
+  mapped into the guest up front via `hv_vm_map` and stays resident; reclaiming it needs
+  `hv_vm_unmap` of the reported regions **plus a lazy-remap data-abort handler** in the
+  HVF vcpu loop (`src/vmm/src/macos/vstate.rs`), since the guest reuses reported pages
+  later. That is a hypervisor-core change with real crash risk and is intentionally left
+  as the one remaining macOS-host item rather than rushed.
+
+### Remaining work
+
+- **macOS physical reclaim for #A:** `hv_vm_unmap` reported ranges + on-fault remap in the
+  HVF vcpu loop (above). Largest, riskiest item; deferred deliberately.
+- **Warm pool late workspace attach (#F):** guest-side bind / virtio-fs hot-plug so a
+  pooled VM can take an arbitrary per-session workspace.
+- **Snapshot/restore (#F):** the long-term cheap-scheduling lever; deferred in libkrun.
 
 ---
 

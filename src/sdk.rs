@@ -2,7 +2,7 @@ use crate::config::SandboxConfig;
 use crate::error::{Error, Result};
 use crate::runtime::{Sandbox, SandboxId, SandboxManager, WorkspaceMountInfo};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::SeekFrom;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -184,6 +184,204 @@ impl SandboxManagerSdk {
         }
         Ok(())
     }
+
+    /// Start a background task that shrinks idle, resize-enabled sandboxes back
+    /// to their configured memory floor, returning the unused RAM to the host.
+    ///
+    /// This is the host-side interim for automatic reclaim until guest-kernel
+    /// free-page reporting lands (design doc #A vs #H). It only touches sandboxes
+    /// created with resize headroom (`--memory-max-mib` > `--memory-mib`); others
+    /// are left alone. A sandbox is "idle" when it has no active interactive
+    /// session and no live exec processes. Opt-in: embedders running a long-lived
+    /// [`SandboxManagerSdk`] call this once; the returned handle aborts the loop
+    /// when dropped (or call `.abort()`).
+    pub fn spawn_idle_reclaim(&self, config: IdleReclaimConfig) -> tokio::task::JoinHandle<()> {
+        let manager = self.manager.clone();
+        tokio::spawn(async move {
+            let mut idle_since: HashMap<String, std::time::Instant> = HashMap::new();
+            loop {
+                sleep(config.poll_interval).await;
+                let scan_manager = manager.clone();
+                let candidates =
+                    match tokio::task::spawn_blocking(move || reclaim_scan(&scan_manager)).await {
+                        Ok(Ok(candidates)) => candidates,
+                        _ => continue,
+                    };
+                let mut seen = std::collections::HashSet::new();
+                for candidate in candidates {
+                    let key = candidate.id.as_str().to_string();
+                    seen.insert(key.clone());
+                    if candidate.busy {
+                        idle_since.remove(&key);
+                        continue;
+                    }
+                    let first_idle = *idle_since
+                        .entry(key.clone())
+                        .or_insert_with(std::time::Instant::now);
+                    if first_idle.elapsed() >= config.idle_after {
+                        let resize_manager = manager.clone();
+                        let id = candidate.id.clone();
+                        let floor = candidate.floor_mib;
+                        // resize_memory to the floor is idempotent, so leaving the
+                        // timer in place simply re-asserts the floor each cycle.
+                        let _ = tokio::task::spawn_blocking(move || {
+                            resize_manager.resize_memory(&id, floor)
+                        })
+                        .await;
+                    }
+                }
+                idle_since.retain(|key, _| seen.contains(key));
+            }
+        })
+    }
+}
+
+/// Tuning for [`SandboxManagerSdk::spawn_idle_reclaim`].
+#[derive(Debug, Clone, Copy)]
+pub struct IdleReclaimConfig {
+    /// How often to scan running sandboxes.
+    pub poll_interval: Duration,
+    /// A resize-enabled sandbox idle for at least this long is shrunk to its
+    /// memory floor.
+    pub idle_after: Duration,
+}
+
+impl Default for IdleReclaimConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(15),
+            idle_after: Duration::from_secs(60),
+        }
+    }
+}
+
+/// A running, resize-enabled sandbox the reclaim loop may act on.
+struct ReclaimCandidate {
+    id: SandboxId,
+    busy: bool,
+    floor_mib: u32,
+}
+
+/// Enumerate running, resize-enabled sandboxes and whether each is currently
+/// busy (active session or live exec process). Blocking; run via spawn_blocking.
+fn reclaim_scan(manager: &SandboxManager) -> Result<Vec<ReclaimCandidate>> {
+    let mut out = Vec::new();
+    for summary in manager.list()? {
+        if !summary.running {
+            continue;
+        }
+        let limits = match manager.memory_limits(&summary.id) {
+            Ok(limits) => limits,
+            Err(_) => continue,
+        };
+        if !limits.resize_enabled() {
+            continue;
+        }
+        // Resize needs the per-VM control socket; skip if it is not up yet.
+        if !manager.control_socket_path(&summary.id).exists() {
+            continue;
+        }
+        let busy = active_session_pid(&summary.state_dir).ok().flatten().is_some()
+            || has_live_processes(&summary.state_dir);
+        out.push(ReclaimCandidate {
+            id: summary.id,
+            busy,
+            floor_mib: limits.min_mib,
+        });
+    }
+    Ok(out)
+}
+
+/// A pool of pre-booted sandboxes built from a template config, handed out on
+/// demand so a new agent session skips the ~1.3 s cold boot (design doc #F).
+///
+/// Pooled sandboxes share the template's mounts/credentials. Per-session
+/// workspace attach after boot awaits guest-side bind or virtio-fs hot-plug, so
+/// today the pool fits fleets of interchangeable sandboxes — e.g. a shared
+/// workspace, or none — rather than arbitrary per-session host directories.
+/// Admission control (`ResourceLedger`) still applies to each booted VM, so the
+/// pool never oversubscribes the host budget.
+#[derive(Clone)]
+pub struct WarmPool {
+    sdk: SandboxManagerSdk,
+    template: SandboxConfig,
+    size: usize,
+    ready: Arc<Mutex<VecDeque<SandboxId>>>,
+    counter: Arc<AtomicU64>,
+}
+
+impl WarmPool {
+    pub fn new(sdk: SandboxManagerSdk, template: SandboxConfig, size: usize) -> Self {
+        Self {
+            sdk,
+            template,
+            size,
+            ready: Arc::new(Mutex::new(VecDeque::new())),
+            counter: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Number of pre-booted sandboxes currently ready to hand out.
+    pub async fn ready_count(&self) -> usize {
+        self.ready.lock().await.len()
+    }
+
+    /// Bring the pool up to its target size, booting sandboxes as needed.
+    pub async fn prewarm(&self) -> Result<()> {
+        self.refill().await
+    }
+
+    /// Take a ready sandbox, or boot one on demand when the pool is empty, then
+    /// kick off a background refill so the pool repopulates toward its target.
+    pub async fn acquire(&self) -> Result<SandboxId> {
+        let pooled = self.ready.lock().await.pop_front();
+        let id = match pooled {
+            Some(id) => id,
+            None => self.boot_one().await?,
+        };
+        let me = self.clone();
+        tokio::spawn(async move {
+            let _ = me.refill().await;
+        });
+        Ok(id)
+    }
+
+    async fn refill(&self) -> Result<()> {
+        while self.ready.lock().await.len() < self.size {
+            let id = self.boot_one().await?;
+            self.ready.lock().await.push_back(id);
+        }
+        Ok(())
+    }
+
+    async fn boot_one(&self) -> Result<SandboxId> {
+        let mut config = self.template.clone();
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        // Process-unique name so concurrent pools and runs don't collide.
+        config.name = Some(format!("pool-{}-{}", std::process::id(), n));
+        let sandbox = self.sdk.create_session(config).await?;
+        self.sdk.start_session(&sandbox.id).await?;
+        Ok(sandbox.id)
+    }
+}
+
+/// Whether a sandbox has any live exec process tracked under `processes/`.
+fn has_live_processes(state_dir: &std::path::Path) -> bool {
+    let dir = state_dir.join("processes");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(contents) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if let Some(pid) = json_number(&contents, "pid") {
+            if pid_is_running(pid) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[async_trait]
@@ -2175,6 +2373,62 @@ eval "$INITIAL_COMMAND"
 
         runtime.stop_session(&sandbox.id).await.unwrap();
         std::env::remove_var("TB_SANDBOX_OS_MODE");
+    }
+
+    #[tokio::test]
+    async fn warm_pool_prewarms_and_hands_out_distinct_sandboxes() {
+        let _env_guard = env_lock().lock().unwrap();
+        let root = test_root("warm_pool_prewarms_and_hands_out_distinct_sandboxes");
+        let image = root.join("image");
+        std::fs::create_dir_all(&image).unwrap();
+        std::fs::write(image.join("kernel"), "kernel").unwrap();
+        std::fs::write(image.join("root.raw"), "root").unwrap();
+        std::fs::write(
+            image.join("image.json"),
+            format!(
+                r#"{{
+  "architecture": "{}",
+  "kernel": "kernel",
+  "root_disk": "root.raw"
+}}"#,
+                std::env::consts::ARCH
+            ),
+        )
+        .unwrap();
+        // Fake launcher stays alive briefly so started sessions look running.
+        let launcher = root.join("fake-os-mode.sh");
+        std::fs::write(&launcher, "#!/bin/sh\nsleep 2\n").unwrap();
+        make_executable(&launcher);
+        std::env::set_var("TB_SANDBOX_OS_MODE", &launcher);
+        // Disable admission control so the test is independent of host RAM.
+        std::env::set_var("TB_SANDBOX_MEM_BUDGET_MIB", "0");
+
+        let manager = SandboxManager {
+            state_root: root.join("state"),
+            cache_root: root.join("cache"),
+        };
+        let sdk = SandboxManagerSdk::new(manager.clone());
+        let template = SandboxConfig::new(AgentImageRef::new(&image));
+        let pool = WarmPool::new(sdk, template, 2);
+
+        pool.prewarm().await.unwrap();
+        assert_eq!(pool.ready_count().await, 2);
+
+        let id1 = pool.acquire().await.unwrap();
+        let id2 = pool.acquire().await.unwrap();
+        assert_ne!(id1.as_str(), id2.as_str());
+        // Both handed-out sandboxes are real, listed sandboxes.
+        let ids: Vec<String> = manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id.as_str().to_string())
+            .collect();
+        assert!(ids.contains(&id1.as_str().to_string()));
+        assert!(ids.contains(&id2.as_str().to_string()));
+
+        std::env::remove_var("TB_SANDBOX_OS_MODE");
+        std::env::remove_var("TB_SANDBOX_MEM_BUDGET_MIB");
     }
 
     fn test_root(name: &str) -> PathBuf {

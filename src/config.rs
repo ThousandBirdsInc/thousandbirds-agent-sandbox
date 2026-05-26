@@ -189,6 +189,11 @@ pub struct SandboxConfig {
     pub memory_max_mib: u32,
     /// Floor for runtime memory reclaim, in MiB.
     pub memory_min_mib: u32,
+    /// virtio-fs DAX window size in bytes (0 = disabled). When non-zero, guests
+    /// map shared read-only mounts directly from the host page cache, so many
+    /// sandboxes mounting the same directory share its pages. Requires a guest
+    /// kernel built with `CONFIG_FUSE_DAX`.
+    pub virtiofs_dax_size: u64,
     pub workspace_mounts: Vec<WorkspaceMount>,
     pub credential_profiles: Vec<CredentialProfile>,
     pub extra_credentials: Vec<CredentialSpec>,
@@ -206,11 +211,17 @@ impl SandboxConfig {
         Self {
             name: None,
             image,
-            cpus: 2,
+            // Density-aware default: 1 vCPU. vCPUs are host threads that
+            // oversubscribe fine, so a single agent session does not need two.
+            // A second CPU shaves ~60 ms off guest boot (more parallel systemd)
+            // but adds a thread per VM; raise it with `--cpus` for parallel
+            // builds. See docs/vm-density-and-resource-sharing-design.md (#G).
+            cpus: 1,
             memory_mib: 2048,
             // Default ceiling == initial, i.e. runtime resizing disabled.
             memory_max_mib: 2048,
             memory_min_mib: 512,
+            virtiofs_dax_size: 0,
             workspace_mounts: Vec::new(),
             credential_profiles: Vec::new(),
             extra_credentials: Vec::new(),

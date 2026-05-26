@@ -23,6 +23,11 @@ Environment:
   BASE_BUNDLE=PATH                Existing libkrun bundle with kernel/initramfs
   KERNEL=PATH                     Kernel path override
   INITRAMFS=PATH                  Initramfs path override
+  NO_INITRAMFS=1                  Build a direct-boot image with no initramfs
+                                  (needs a guest kernel with built-in
+                                  CONFIG_VIRTIO_BLK + CONFIG_EXT4_FS; see
+                                  design doc #E). Removes the initramfs load
+                                  from the boot path.
   LIBKRUN_DIR=PATH                Sibling libkrun checkout
 EOF
 }
@@ -148,22 +153,35 @@ chmod 0644 "$overlay_dir/root/etc/systemd/system/agent-sandbox-shell.service"
 
 kernel=${KERNEL:-}
 initramfs=${INITRAMFS:-}
+no_initramfs=${NO_INITRAMFS:-}
 if [ -n "${BASE_BUNDLE:-}" ]; then
   kernel=${kernel:-"$BASE_BUNDLE/kernel"}
-  initramfs=${initramfs:-"$BASE_BUNDLE/initramfs"}
+  if [ -z "$no_initramfs" ]; then
+    initramfs=${initramfs:-"$BASE_BUNDLE/initramfs"}
+  fi
 fi
 
 if [ -z "$kernel" ] || [ ! -f "$kernel" ]; then
   echo "KERNEL or BASE_BUNDLE is required and must point to an existing kernel" >&2
   exit 66
 fi
-if [ -z "$initramfs" ] || [ ! -f "$initramfs" ]; then
+if [ -n "$no_initramfs" ]; then
+  initramfs=""
+elif [ -z "$initramfs" ] || [ ! -f "$initramfs" ]; then
   echo "INITRAMFS or BASE_BUNDLE is required and must point to an existing initramfs" >&2
+  echo "(or set NO_INITRAMFS=1 to build a direct-boot image)" >&2
   exit 66
 fi
 
 rm -rf "$output_dir"
 mkdir -p "$output_dir"
+
+# --initramfs is optional in the rootfs tool; omit it for a direct-boot image.
+if [ -n "$initramfs" ]; then
+  set -- --initramfs "$initramfs"
+else
+  set --
+fi
 
 "$LIBKRUN_DIR/examples/os_mode_build_container_rootfs.py" \
   --image "$tag" \
@@ -175,7 +193,7 @@ mkdir -p "$output_dir"
   --overlay-tar "$overlay_tar" \
   --kernel "$kernel" \
   --kernel-format "$kernel_format" \
-  --initramfs "$initramfs" \
+  "$@" \
   --root-device /dev/vda \
   --root-fstype ext4 \
   --root-options rw \
@@ -183,13 +201,19 @@ mkdir -p "$output_dir"
   --smoke-timeout 180
 
 cp "$kernel" "$output_dir/kernel"
-cp "$initramfs" "$output_dir/initramfs"
+# Direct-boot images omit the initramfs line entirely.
+if [ -n "$initramfs" ]; then
+  cp "$initramfs" "$output_dir/initramfs"
+  initramfs_json='  "initramfs": "initramfs",'
+else
+  initramfs_json=''
+fi
 
 cat > "$output_dir/image.json" <<EOF
 {
   "architecture": "$architecture",
   "kernel": "kernel",
-  "initramfs": "initramfs",
+$initramfs_json
   "root_disk": "root.raw",
   "kernel_format": $kernel_format,
   "kernel_cmdline": "rw",

@@ -22,6 +22,8 @@ pub struct LaunchConfig<'a> {
     /// Unix socket the VMM should serve for runtime resize commands. Present
     /// only when runtime resizing is enabled.
     pub control_socket: Option<&'a Path>,
+    /// virtio-fs DAX window size in bytes (0 = disabled).
+    pub virtiofs_dax_size: u64,
     pub workspace_mounts: &'a [WorkspaceMount],
     pub credentials_mount: Option<&'a Path>,
     pub runtime_config_mount: &'a Path,
@@ -104,6 +106,13 @@ fn launch_command_with_launcher(config: LaunchConfig<'_>, launcher: &Path) -> Re
         command
             .arg("--root-options")
             .arg(&config.image.root_options);
+    }
+    // Open a virtio-fs DAX window so shared read-only mounts are served from the
+    // host page cache (shared across VMs) instead of copied per-guest.
+    if config.virtiofs_dax_size > 0 {
+        command
+            .arg("--virtiofs-dax-size")
+            .arg(config.virtiofs_dax_size.to_string());
     }
     match config.network_backend {
         NetworkBackend::None => {}
