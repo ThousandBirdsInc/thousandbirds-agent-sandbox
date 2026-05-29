@@ -1,45 +1,105 @@
-#!/bin/sh
+#!/bin/bash
 # agent-sandbox-quiesce: cooperative quiesce daemon for snapshots.
 #
-# Polls the runtime-control mount for `quiesce.req`, calls `sync` to flush
-# the rootfs, writes `quiesce.ack`, waits for `resume.req` (bounded by the
-# request's `deadline_unix_millis`), and writes `resume.ack`.
+# Polls the runtime-control mount for `quiesce.req`, syncs (and optionally
+# `fsfreeze`s) the rootfs, writes `quiesce.ack`, waits for `resume.req`
+# (bounded by the request's `deadline_unix_millis`), unfreezes, writes
+# `resume.ack`.
 #
 # Protocol: see src/quiesce.rs for the wrapper-side counterpart and the
 # canonical text key=value format. Files live in the runtime-control
 # virtio-fs mount at /run/agent-sandbox/control/ (host side:
 # <sandbox_dir>/runtime-control/, mode 0777).
 #
-# This build implements **sync-only** quiescence. A `freeze` action request
-# is downgraded to sync because driving `fsfreeze -f /` from a daemon hosted
-# on the frozen rootfs would deadlock the daemon's own polling loop the
-# moment it tried to exec /bin/sleep (rootfs is frozen, exec faults block).
-# Doing freeze safely requires either caching /bin/sleep + /sbin/fsfreeze in
-# tmpfs and a bash-builtin polling strategy, or kernel-level changes. The
-# wrapper records the actual action performed in the manifest so manifests
-# never lie about what really ran.
+# ## Strict freeze (Phase 2 follow-on)
+#
+# The freeze action requires the daemon to keep running with the rootfs
+# frozen. That deadlocks naïve shell daemons because:
+#
+#   - `sleep 0.1` is an exec of /bin/sleep, which lives on the frozen
+#     rootfs (kernel blocks the exec on filesystem read).
+#   - `date +%s` is an exec of /bin/date — same problem.
+#
+# This implementation works around both by:
+#
+#   1. Running bash (not /bin/sh), so we can use the bash 5+ builtin
+#      `EPOCHREALTIME` for time and `read -t TIMEOUT` on a fifo for sleep
+#      — both pure builtins with zero exec.
+#   2. Caching /sbin/fsfreeze to /run (tmpfs) before issuing the freeze,
+#      then unfreezing via the cached copy after resume. The cached
+#      binary lives in tmpfs so the exec itself doesn't touch the frozen
+#      rootfs.
+#
+# Caveat: dynamically-linked binaries (fsfreeze depends on libc) still
+# page-fault on first call from /lib/ on rootfs. We mitigate by running
+# the cached fsfreeze once before the actual freeze so libc pages are
+# warm in the page cache. Under memory pressure the kernel may evict
+# those pages and re-faulting them during unfreeze would deadlock — the
+# wrapper's per-request `deadline_unix_millis` is the safety net (the
+# wrapper hard-fails after timeout; the resulting `resume.req` write is
+# in virtio-fs which is unaffected).
 
 set -u
 
 CONTROL_DIR="${AGENT_SANDBOX_CONTROL_DIR:-/run/agent-sandbox/control}"
 POLL_SEC="${AGENT_SANDBOX_QUIESCE_POLL_SEC:-0.1}"
+CACHE_DIR="${AGENT_SANDBOX_QUIESCE_CACHE_DIR:-/run/agent-sandbox-quiesce-cache}"
+SLEEP_FIFO="$CACHE_DIR/sleep.fifo"
+FSFREEZE_CACHED="$CACHE_DIR/fsfreeze"
 
 log() {
   printf 'agent-sandbox-quiesce: %s\n' "$*" >&2
 }
 
+# Millis since epoch, via the bash 5+ builtin EPOCHREALTIME. Zero exec.
 now_ms() {
-  # Second precision is enough; the wrapper's safety window is in minutes.
-  # Multiply to keep the unit consistent with what the wrapper writes.
-  s=$(date +%s 2>/dev/null || echo 0)
-  printf '%s000\n' "$s"
+  local t="${EPOCHREALTIME:-}"
+  if [[ -z "$t" ]]; then
+    # Fallback for older bash: second precision via printf -v + SECONDS
+    # is unreliable; just use $(date) and accept the rootfs touch when
+    # not under freeze.
+    printf '%s000' "$(date +%s 2>/dev/null || echo 0)"
+    return
+  fi
+  local sec="${t%.*}"
+  local frac="${t#*.}"
+  # Pad fractional seconds to 6 digits then take first 3 (millis).
+  frac="${frac}000000"
+  printf '%s%s' "$sec" "${frac:0:3}"
+}
+
+# Sleep without exec: read with timeout from a fifo nobody writes to.
+# bash returns 142 on timeout, 0 if a write somehow arrived; either way
+# we proceed.
+builtin_sleep() {
+  local seconds="$1"
+  read -t "$seconds" -u 9 -r _ 2>/dev/null
+  return 0
+}
+
+# Set up tmpfs cache (fifo for sleep, copy of fsfreeze for unfreeze).
+setup_cache() {
+  mkdir -p "$CACHE_DIR" 2>/dev/null || true
+  if [[ ! -p "$SLEEP_FIFO" ]]; then
+    mkfifo "$SLEEP_FIFO" 2>/dev/null || true
+  fi
+  # Open the fifo on fd 9 for read+write so read blocks (no EOF on a
+  # writer-less pipe) but a write would unblock us if anyone needed to
+  # signal early.
+  exec 9<>"$SLEEP_FIFO" 2>/dev/null || true
+
+  if command -v fsfreeze >/dev/null 2>&1; then
+    local src
+    src=$(command -v fsfreeze)
+    if cp -f "$src" "$FSFREEZE_CACHED" 2>/dev/null; then
+      chmod 0755 "$FSFREEZE_CACHED" 2>/dev/null || true
+    fi
+  fi
 }
 
 read_field() {
-  # read_field KEY FILE -> prints value, returns 0 found / 1 missing
-  key="$1"
-  file="$2"
-  [ -f "$file" ] || return 1
+  local key="$1" file="$2" line
+  [[ -f "$file" ]] || return 1
   while IFS= read -r line; do
     case "$line" in
       "${key}="*)
@@ -52,82 +112,116 @@ read_field() {
 }
 
 write_response() {
-  # Atomic write so a wrapper reading concurrently never sees half a file.
-  final="$1"
-  content="$2"
-  tmp="${final}.tmp.$$"
+  local final="$1" content="$2"
+  local tmp="${final}.tmp.$$"
   printf '%s' "$content" > "$tmp" 2>/dev/null || return 1
   mv -f "$tmp" "$final" 2>/dev/null
 }
 
+# Run cached fsfreeze. Falls back to the on-path binary if the cache
+# wasn't populated (e.g. fsfreeze missing at daemon start).
+run_fsfreeze() {
+  local arg="$1"
+  if [[ -x "$FSFREEZE_CACHED" ]]; then
+    "$FSFREEZE_CACHED" "$arg" / 2>/dev/null
+    return $?
+  fi
+  fsfreeze "$arg" / 2>/dev/null
+}
+
 handle_quiesce() {
-  req="$CONTROL_DIR/quiesce.req"
+  local req="$CONTROL_DIR/quiesce.req"
+  local id action deadline
   id=$(read_field id "$req") || return 0
-  [ -n "$id" ] || return 0
+  [[ -n "$id" ]] || return 0
   action=$(read_field action "$req" 2>/dev/null) || action=""
   deadline=$(read_field deadline_unix_millis "$req" 2>/dev/null) || deadline=""
-  [ -n "$action" ] || action="sync"
-  [ -n "$deadline" ] || deadline="0"
+  [[ -n "$action" ]] || action="sync"
+  [[ -n "$deadline" ]] || deadline="0"
 
   sync 2>/dev/null
 
-  performed="sync"
-  message=""
-  if [ "$action" = "freeze" ]; then
-    message="freeze requested; downgraded to sync (guest-side freeze not implemented in this build)"
+  local performed="sync"
+  local message=""
+  local frozen=0
+
+  if [[ "$action" == "freeze" ]]; then
+    if [[ -x "$FSFREEZE_CACHED" ]] || command -v fsfreeze >/dev/null 2>&1; then
+      # Warm the page cache: a no-op file stat plus a touch-then-untouch
+      # of the cached binary to make sure libc pages it references are
+      # resident before we freeze. Best-effort.
+      [[ -x "$FSFREEZE_CACHED" ]] && "$FSFREEZE_CACHED" --help >/dev/null 2>&1 || true
+
+      if run_fsfreeze --freeze; then
+        performed="freeze"
+        frozen=1
+      else
+        message="fsfreeze --freeze failed; downgraded to sync"
+      fi
+    else
+      message="fsfreeze unavailable; downgraded to sync"
+    fi
   fi
 
+  local achieved
   achieved=$(now_ms)
-  ack="id=${id}
+  local ack="id=${id}
 status=ok
 action=${performed}
 achieved_unix_millis=${achieved}
 "
-  if [ -n "$message" ]; then
+  if [[ -n "$message" ]]; then
     ack="${ack}message=${message}
 "
   fi
   if ! write_response "$CONTROL_DIR/quiesce.ack" "$ack"; then
     log "failed to write quiesce.ack for id=${id}"
+    # If we froze, attempt unfreeze before exiting the handler so we
+    # don't leave the rootfs wedged.
+    [[ "$frozen" -eq 1 ]] && run_fsfreeze --unfreeze
     return 0
   fi
 
-  # Wait for resume.req or deadline. The wrapper writes a deadline several
-  # minutes out as a safety net; if the wrapper crashes between freeze and
-  # release, the deadline triggers an auto-resume so we never wedge.
-  if [ "$deadline" -gt 0 ] 2>/dev/null; then
+  # Wait for resume.req or deadline. Inside the wait loop we cannot
+  # exec ANYTHING from the frozen rootfs (except the cached fsfreeze),
+  # so we use only bash builtins.
+  local effective_deadline
+  if [[ "$deadline" -gt 0 ]] 2>/dev/null; then
     effective_deadline="$deadline"
   else
     effective_deadline=$((achieved + 5 * 60 * 1000))
   fi
 
-  resume_id=""
-  auto_resumed=0
+  local resume_id=""
+  local auto_resumed=0
   while true; do
-    if [ -f "$CONTROL_DIR/resume.req" ]; then
+    if [[ -f "$CONTROL_DIR/resume.req" ]]; then
       resume_id=$(read_field id "$CONTROL_DIR/resume.req" 2>/dev/null) || resume_id=""
       break
     fi
+    local now
     now=$(now_ms)
-    if [ "$now" -ge "$effective_deadline" ] 2>/dev/null; then
+    if [[ "$now" -ge "$effective_deadline" ]] 2>/dev/null; then
       auto_resumed=1
       break
     fi
-    sleep "$POLL_SEC" 2>/dev/null || sleep 1
+    builtin_sleep "$POLL_SEC"
   done
 
-  if [ "$auto_resumed" -eq 1 ]; then
+  if [[ "$auto_resumed" -eq 1 ]]; then
     log "auto-resumed after deadline (no resume.req for id=${id})"
   fi
 
-  # Defense-in-depth: flush again so anything the wrapper wrote during the
-  # quiesce window through a different channel is durable.
+  # Unfreeze BEFORE any further exec — we use the cached fsfreeze copy.
+  if [[ "$frozen" -eq 1 ]]; then
+    run_fsfreeze --unfreeze
+  fi
+
+  # Defense-in-depth: flush again now that we're unfrozen.
   sync 2>/dev/null
 
-  # Always write resume.ack when we saw a real resume.req so the wrapper's
-  # release() returns cleanly. On auto-resume the wrapper has likely moved
-  # on already; nothing to ack to.
-  if [ -n "$resume_id" ]; then
+  if [[ -n "$resume_id" ]]; then
+    local resumed
     resumed=$(now_ms)
     if ! write_response "$CONTROL_DIR/resume.ack" "id=${resume_id}
 status=ok
@@ -137,26 +231,27 @@ resumed_unix_millis=${resumed}
     fi
   fi
 
-  # Sweep our request files so a daemon restart does not re-handle a stale
-  # cycle. The wrapper's next cycle does its own sweep too.
   rm -f "$CONTROL_DIR/quiesce.req" "$CONTROL_DIR/resume.req"
 }
 
-# Wait for the control mount. agent-sandbox-shell mounts it lazily, so on
-# early boot the daemon may race the mount; bound the wait at ~60s.
+# Wait for the control mount.
 i=0
-while [ ! -d "$CONTROL_DIR" ] && [ "$i" -lt 600 ]; do
+while [[ ! -d "$CONTROL_DIR" ]] && [[ "$i" -lt 600 ]]; do
   sleep 0.1
   i=$((i + 1))
 done
-if [ ! -d "$CONTROL_DIR" ]; then
+if [[ ! -d "$CONTROL_DIR" ]]; then
   log "control dir $CONTROL_DIR never appeared; exiting"
   exit 1
 fi
 
+setup_cache
+
 while true; do
-  if [ -f "$CONTROL_DIR/quiesce.req" ]; then
+  if [[ -f "$CONTROL_DIR/quiesce.req" ]]; then
     handle_quiesce
   fi
+  # Outside a freeze cycle we can use a normal sleep (touches rootfs
+  # but rootfs is not frozen here, so the exec returns immediately).
   sleep "$POLL_SEC" 2>/dev/null || sleep 1
 done

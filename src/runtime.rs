@@ -341,8 +341,9 @@ impl SandboxManager {
 
         profile_mark("backend_ready");
         let proxy = if stored.network_proxy.enabled && launch_network_backend.is_enabled() {
-            let proxy = NetworkProxy::start(
+            let proxy = NetworkProxy::start_with_egress_allowlist(
                 stored.network_proxy.header_rules.clone(),
+                stored.network_proxy.egress_allowlist.clone(),
                 stored.network_proxy.tls_mitm,
             )?;
             write_proxy_env(&stored.runtime_config, Some(&proxy))?;
@@ -448,8 +449,9 @@ impl SandboxManager {
             })
             .unwrap_or_else(|| stored.network_backend.clone());
         let proxy = if stored.network_proxy.enabled && launch_network_backend.is_enabled() {
-            let proxy = NetworkProxy::start(
+            let proxy = NetworkProxy::start_with_egress_allowlist(
                 stored.network_proxy.header_rules.clone(),
+                stored.network_proxy.egress_allowlist.clone(),
                 stored.network_proxy.tls_mitm,
             )?;
             write_proxy_env(&stored.runtime_config, Some(&proxy))?;
@@ -1171,6 +1173,7 @@ impl SandboxManager {
                 enabled: json_bool(&json, "network_proxy_enabled").unwrap_or(true),
                 tls_mitm: json_bool(&json, "network_proxy_tls_mitm").unwrap_or(true),
                 header_rules: parse_proxy_header_rules(&json)?,
+                egress_allowlist: json_string_array(&json, "egress_allowlist").unwrap_or_default(),
             },
             network_backend: parse_network_backend(&json)?,
             restore_source: json_string(&json, "restore_source")
@@ -1749,6 +1752,7 @@ fn write_sandbox_metadata(path: &Path, stored: &StoredSandbox) -> Result<()> {
             "  \"network_proxy_tls_mitm\": {},\n",
             "  \"network_backend\": \"{}\",\n",
             "  \"proxy_header_rules\": [{}],\n",
+            "  \"egress_allowlist\": [{}],\n",
             "  \"restore_source\": \"{}\",\n",
             "  \"workspace_mounts\": [{}]\n",
             "}}\n"
@@ -1773,6 +1777,13 @@ fn write_sandbox_metadata(path: &Path, stored: &StoredSandbox) -> Result<()> {
             .header_rules
             .iter()
             .map(|rule| format!("\"{}\"", crate::credentials::escape_json(&rule.encode())))
+            .collect::<Vec<_>>()
+            .join(", "),
+        stored
+            .network_proxy
+            .egress_allowlist
+            .iter()
+            .map(|pattern| format!("\"{}\"", crate::credentials::escape_json(pattern)))
             .collect::<Vec<_>>()
             .join(", "),
         crate::credentials::escape_json(

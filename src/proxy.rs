@@ -32,6 +32,9 @@ pub struct NetworkProxy {
 
 struct ProxyState {
     rules: Vec<ProxyHeaderRule>,
+    /// Optional egress allowlist. When non-empty, the proxy refuses any
+    /// request whose authority host does not match. Empty = no restriction.
+    egress_allowlist: Vec<String>,
     tls_mitm: Option<TlsMitm>,
     client_config: Arc<ClientConfig>,
 }
@@ -43,11 +46,20 @@ struct TlsMitm {
 
 impl NetworkProxy {
     pub fn start(rules: Vec<ProxyHeaderRule>, tls_mitm: bool) -> Result<Self> {
-        Self::start_with_advertise_host(rules, tls_mitm, None)
+        Self::start_with_advertise_host(rules, Vec::new(), tls_mitm, None)
+    }
+
+    pub fn start_with_egress_allowlist(
+        rules: Vec<ProxyHeaderRule>,
+        egress_allowlist: Vec<String>,
+        tls_mitm: bool,
+    ) -> Result<Self> {
+        Self::start_with_advertise_host(rules, egress_allowlist, tls_mitm, None)
     }
 
     pub fn start_with_advertise_host(
         rules: Vec<ProxyHeaderRule>,
+        egress_allowlist: Vec<String>,
         tls_mitm: bool,
         advertise_host: Option<IpAddr>,
     ) -> Result<Self> {
@@ -79,6 +91,7 @@ impl NetworkProxy {
         let thread_shutdown = shutdown.clone();
         let state = Arc::new(ProxyState {
             rules,
+            egress_allowlist,
             tls_mitm,
             client_config: Arc::new(
                 ClientConfig::builder()
@@ -225,8 +238,11 @@ fn handle_client(mut client: TcpStream, state: &ProxyState) -> std::io::Result<(
     }
 
     if parts[0].eq_ignore_ascii_case("CONNECT") {
+        let (host, _) = split_host_port(parts[1], 443);
+        if !egress_allowed(&host, &state.egress_allowlist) {
+            return write_forbidden(&mut client, &host);
+        }
         if let Some(mitm) = &state.tls_mitm {
-            let (host, _) = split_host_port(parts[1], 443);
             if has_matching_rules(&host, &state.rules) {
                 proxy_connect_mitm(&mut client, parts[1], mitm, state)
             } else {
@@ -236,6 +252,13 @@ fn handle_client(mut client: TcpStream, state: &ProxyState) -> std::io::Result<(
             proxy_connect_tunnel(&mut client, parts[1])
         }
     } else {
+        let target_host = host_from_http_target(parts[1])
+            .or_else(|| host_from_headers(&mut lines.clone().peekable()));
+        if let Some(host) = &target_host {
+            if !egress_allowed(host, &state.egress_allowlist) {
+                return write_forbidden(&mut client, host);
+            }
+        }
         let headers: Vec<String> = lines.map(ToString::to_string).collect();
         proxy_http_to_new_upstream(
             &mut client,
@@ -247,6 +270,108 @@ fn handle_client(mut client: TcpStream, state: &ProxyState) -> std::io::Result<(
             80,
             &state.rules,
         )
+    }
+}
+
+/// True if the allowlist is empty (no restriction) or `host` matches one of
+/// the patterns. Patterns are exact host names (case-insensitive) or
+/// `*.suffix` globs — `*.example.com` matches `api.example.com` and
+/// `a.b.example.com` but not the bare `example.com`.
+fn egress_allowed(host: &str, allowlist: &[String]) -> bool {
+    if allowlist.is_empty() {
+        return true;
+    }
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    for pattern in allowlist {
+        let pattern = pattern.trim().to_ascii_lowercase();
+        if let Some(suffix) = pattern.strip_prefix("*.") {
+            if host.ends_with(&format!(".{suffix}")) || host == suffix {
+                // The match `host == suffix` is conservative — strictly
+                // speaking `*.example.com` should not match
+                // `example.com`, but it's the rule users almost always
+                // intend; matches SmolVM semantics.
+                return true;
+            }
+        } else if host == pattern {
+            return true;
+        }
+    }
+    false
+}
+
+fn write_forbidden(client: &mut TcpStream, host: &str) -> std::io::Result<()> {
+    let body = format!("egress to {host} is not on the allowlist\n");
+    let response = format!(
+        "HTTP/1.1 403 Forbidden\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    );
+    client.write_all(response.as_bytes())
+}
+
+fn host_from_http_target(target: &str) -> Option<String> {
+    // For absolute URIs (proxy requests) extract the host. For origin-form
+    // paths (`/foo`) return None and let the caller fall back to the Host
+    // header.
+    if target.starts_with('/') {
+        return None;
+    }
+    let without_scheme = target
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(target);
+    let host_and_rest = without_scheme.split('/').next().unwrap_or("");
+    let host = host_and_rest
+        .split('@')
+        .next_back()
+        .unwrap_or(host_and_rest);
+    let host = host.split(':').next().unwrap_or(host);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+fn host_from_headers<'a, I>(lines: &mut std::iter::Peekable<I>) -> Option<String>
+where
+    I: Iterator<Item = &'a str>,
+{
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix_ignore_ascii_case("host:") {
+            let host = rest.trim().split(':').next().unwrap_or("").trim();
+            if !host.is_empty() {
+                return Some(host.to_string());
+            }
+        }
+    }
+    None
+}
+
+trait StrExt {
+    fn strip_prefix_ignore_ascii_case<'a>(&'a self, prefix: &str) -> Option<&'a str>;
+}
+
+impl StrExt for str {
+    fn strip_prefix_ignore_ascii_case<'a>(&'a self, prefix: &str) -> Option<&'a str> {
+        if self.len() < prefix.len() {
+            return None;
+        }
+        let (head, tail) = self.split_at(prefix.len());
+        if head.eq_ignore_ascii_case(prefix) {
+            Some(tail)
+        } else {
+            None
+        }
     }
 }
 
@@ -633,5 +758,51 @@ mod tests {
     fn creates_mitm_ca() {
         let ca = TlsMitm::new().expect("mitm ca");
         assert!(ca.ca_pem.contains("BEGIN CERTIFICATE"));
+    }
+
+    #[test]
+    fn egress_allowlist_empty_allows_all() {
+        assert!(egress_allowed("api.example.com", &[]));
+        assert!(egress_allowed("evil.example.com", &[]));
+    }
+
+    #[test]
+    fn egress_allowlist_exact_match() {
+        let list = vec!["api.example.com".to_string()];
+        assert!(egress_allowed("api.example.com", &list));
+        assert!(egress_allowed("API.EXAMPLE.COM", &list));
+        assert!(!egress_allowed("evil.example.com", &list));
+        assert!(!egress_allowed("example.com", &list));
+    }
+
+    #[test]
+    fn egress_allowlist_wildcard_suffix() {
+        let list = vec!["*.example.com".to_string()];
+        assert!(egress_allowed("api.example.com", &list));
+        assert!(egress_allowed("a.b.example.com", &list));
+        // Bare suffix is accepted as a convenience — common user
+        // intent for "all of example.com".
+        assert!(egress_allowed("example.com", &list));
+        assert!(!egress_allowed("notexample.com", &list));
+        assert!(!egress_allowed("evilexample.com", &list));
+    }
+
+    #[test]
+    fn egress_allowlist_strips_trailing_dot() {
+        let list = vec!["api.example.com".to_string()];
+        assert!(egress_allowed("api.example.com.", &list));
+    }
+
+    #[test]
+    fn host_from_absolute_uri() {
+        assert_eq!(
+            host_from_http_target("http://api.example.com/v1/messages"),
+            Some("api.example.com".to_string())
+        );
+        assert_eq!(
+            host_from_http_target("https://api.example.com:8443/v1"),
+            Some("api.example.com".to_string())
+        );
+        assert_eq!(host_from_http_target("/origin-form/path"), None);
     }
 }

@@ -966,7 +966,7 @@ sh -n scripts/build-agent-image.sh
 sh -n scripts/profile-sandbox.sh
 sh -n guest/agent-sandbox-shell
 sh -n guest/agent-sandbox-import-credentials
-sh -n guest/agent-sandbox-quiesce
+bash -n guest/agent-sandbox-quiesce
 sh -n guest/agent-sandbox-browser
 cc -Wall -Wextra -c guest/agent-sandbox-login-tty.c -o /tmp/agent-sandbox-login-tty.o
 cargo check

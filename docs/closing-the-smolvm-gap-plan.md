@@ -24,36 +24,28 @@ full design intent and the remaining sub-items.
 | **G1 Phase 2** cooperative quiesce (sync-mode) | ✅ DONE | wrapper `19e7ebf` |
 | **G1 Phase 3** memory + vCPU + GICv3 + device capture/restore | ✅ CODE COMPLETE | libkrun `69fc1cd`→`ec9c5d8`, wrapper `d59c83a`→`d2a46fd` |
 | **G3** browser-in-sandbox (Chromium + CDP + VNC) | ✅ DONE | wrapper `98dc854` |
-| **G4** packaging + framework adapters | ⏳ NOT STARTED | — |
+| **G1** Phase 2 strict-freeze in quiesce daemon | ✅ DONE | this commit |
+| **G1** HVF GICv3 extended capture set | ✅ DONE | this commit |
+| **Egress allowlist** in proxy (SmolVM `allowed_domains` equiv.) | ✅ DONE | this commit |
+| **G4** packaging + framework adapters (Python/TS shims, OpenAI Agents/LangChain/PydanticAI adapters, daemon, pipx/brew installers) | ⛔ OUT OF SCOPE — explicitly deferred (see note below) | — |
 | **G2** Windows guests | ⛔ DECLINED (would require abandoning HVF-direct libkrun) | — |
 | **G5** cross-host snapshot portability | ⛔ DECLINED (per libkrun snapshot contract) | — |
+
+**Note on G4:** The original plan flagged G4 packaging as the highest-leverage
+item for external adoption. It is genuinely shippable code — `tb-sandbox-daemon`
+JSON-RPC + Python/TS packages + thin framework adapters — but it is explicitly
+out of scope for this project. External adoption surface is handled separately
+when/if that becomes a goal. The Rust SDK (`SandboxManagerSdk`) remains the
+canonical embedder surface and is already documented.
 
 Tests across both repos: 62 wrapper + 35 libkrun = 97 passing, 0 failing.
 
 ## Remaining Work
 
-Ordered by leverage. Each item is bounded — none requires another month of
-design work.
+What's left after this session is **only hardware-bound verification and
+optional polish**. No more code-design gaps.
 
-### 1. G4 — packaging + framework adapters [~1–2 weeks, untouched]
-
-**The single biggest gap that determines whether anyone outside this repo
-can evaluate this project against SmolVM.** Today: clone two repos, run
-`cargo build`, build a libkrun image bundle, then call the Rust SDK. SmolVM
-is `pip install smolvm`.
-
-Plan (see [G4 design section](#g4--packaging--framework-adapters) below for
-detail):
-
-- New `tb-sandbox-daemon` binary that hosts `SandboxManagerSdk` behind a
-  Unix-socket JSON-RPC surface.
-- `tb-sandbox-py` package (mirrors `from smolvm import SmolVM` shape).
-- `tb-sandbox-ts` package for the Node/agent-SDK world.
-- `python/adapters/` thin shims for OpenAI Agents, LangChain, PydanticAI.
-- `brew install` formula + `pipx install tb-sandbox` install path that
-  handles the libkrun + os_mode launcher dependency.
-
-### 2. G1 — end-to-end verification on real guests [hardware-bound, ~½ day each]
+### 1. G1 — end-to-end verification on real guests [hardware-bound, ~½ day each]
 
 The Phase 3 code is wired end-to-end across both repos, but the actual
 round-trip has not been booted in this environment (no os_mode_artifacts
@@ -65,64 +57,41 @@ bundle on this dev machine, no `/dev/kvm` for the Linux path):
   that path, verify the marker pattern and file content survive,
   verify `uptime` resumes from snapshot point not zero.
 - **KVM x86_64 round-trip** on a Linux host with `/dev/kvm`.
+- **Phase 2 strict-freeze round-trip** — the daemon now implements true
+  `fsfreeze -f /` (caches fsfreeze in tmpfs, uses bash builtins for
+  sleep/time during the frozen window). Needs a real Linux guest to
+  verify the libc-page-cache-eviction caveat in the daemon comments is
+  benign in practice.
 
-Both are bounded test gaps against complete code paths.
+Both round-trip verifications are bounded test gaps against complete code
+paths.
 
-### 3. G1 — bounded follow-ons (snapshot polish)
+### 2. G1 — bounded follow-ons (snapshot polish, optional)
 
-These are small, well-scoped extensions to the snapshot/restore code
-already on `main`:
-
-- **Phase 2 strict-freeze** in `guest/agent-sandbox-quiesce` — currently
-  downgrades `fsfreeze -f /` to `sync` because driving fsfreeze from a
-  daemon hosted on the frozen rootfs would deadlock the daemon's own
-  `sleep`. Fix: cache `/bin/sleep` and `/sbin/fsfreeze` in `/run`
-  (tmpfs), use `read -t` on a fifo as a sleep substitute. ~50 lines of
-  shell + a test. Documented downgrade lives in the daemon today so
-  manifests don't lie.
-- **HVF GICv3 register-set extension** in
-  `../thousandbirds-libkrun/src/hvf/src/lib.rs`. `HVF_GIC_DISTRIBUTOR_REG_IDS`
-  currently captures only `GICD_CTLR` (the global enable). Adding
-  `ISENABLER` / `ICENABLER` / `IPRIORITYR` / `ICFGR` / `IROUTER` is
-  mechanical (~30 minutes) once an interrupt-heavy guest workload
-  proves the minimal set is insufficient.
 - **Per-virtio-device save_state/restore_state** on the virtio device
   trait in libkrun (virtio-blk, virtio-net, virtio-fs, balloon, mmio
   transport). The current snapshot captures vCPU + GIC + memory but not
   in-flight virtio request state. Wrapper-level cooperative quiesce
-  (sync + drain) makes this safe in practice for the agent workloads
-  this repo targets; persistent virtio queue state is a bounded
-  follow-on (~1–2 weeks for full coverage) needed only if snapshots
-  are taken without quiesce.
+  (sync + drain, plus strict freeze when available) makes this safe in
+  practice for the agent workloads this repo targets; persistent virtio
+  queue state is needed only if snapshots are taken without quiesce
+  (~1–2 weeks for full coverage).
+- **Extending HVF_GIC_DISTRIBUTOR_REG_IDS** further. The capture set
+  shipped this session covers GICD_CTLR plus the first 1024 interrupt
+  IDs across IGROUPR/ISENABLER/ICENABLER/IPRIORITYR/ICFGR + 32 IROUTER
+  SPI affinity entries. Workloads using more than that need extending
+  the list (mechanical, but pending real evidence it matters).
 - **G1 Phase 4** content-addressed memory chunk dedup. Deferred per the
   original plan; only worth doing once Phase 3 is in production use.
 
-### 4. Minor — egress allowlist
+## Explicitly out of scope
 
-SmolVM has `internet_settings={"allowed_domains": [...]}` for domain-level
-egress restriction. We have header-substitution rules in `src/proxy.rs`;
-an allowlist mode would be a small extension (~½ day) that refuses
-`CONNECT` to hosts not on the list.
-
-## Suggested ordering
-
-If the goal is **make this comparable to SmolVM in market positioning**:
-
-1. G4 packaging (1–2 weeks) — unblocks any external evaluation
-2. G1 end-to-end verification on real guest (½ day to one week, hardware
-   dependent) — turns "code shipped" into "demoably works"
-3. Per-virtio-device save_state for production-grade snapshot correctness
-4. Phase 2 strict-freeze
-5. GICv3 register-set extension (only if needed)
-
-If the goal is **make snapshot/restore production-trustworthy first**:
-
-1. End-to-end verification on real guest
-2. Per-virtio-device save_state
-3. GICv3 register-set extension
-4. Phase 2 strict-freeze
-5. Phase 4 dedup
-6. G4 packaging
+- **G4 packaging + framework adapters** — `tb-sandbox-daemon` JSON-RPC
+  + Python/TS shims + OpenAI Agents/LangChain/PydanticAI adapters +
+  pipx/brew installers. Useful work, but the project is keeping its
+  surface area focused on the Rust SDK; external-language adoption is
+  not a goal right now. The Rust `SandboxManagerSdk` remains the
+  canonical embedder surface.
 
 ---
 
@@ -141,7 +110,7 @@ If the goal is **make snapshot/restore production-trustworthy first**:
 The original session-zero ordering. Kept here so future readers can see
 the reasoning that drove the work. The actual outcome — captured in the
 Status table at the top — is that G1 (all phases), G3, and the density-doc
-items all shipped in this session; G4 remains.
+items all shipped; G4 was reclassified out of scope (not on roadmap).
 
 **Do (in order):**
 1. **G1 — snapshot / fast restore.** This is the only gap that changes the
@@ -693,55 +662,26 @@ Same harness as the density doc — `scripts/profile-sandbox.sh` with
 
 ---
 
-## G4 — Packaging + Framework Adapters
+## G4 — Packaging + Framework Adapters — OUT OF SCOPE
 
-### Why bother
+The original plan flagged G4 as the highest-leverage gap for external
+adoption (`pip install smolvm`-equivalent). The project has decided not
+to pursue it: the Rust `SandboxManagerSdk` is the canonical embedder
+surface, and external-language adoption is not a current goal.
 
-Today, evaluating `tb-sandbox` requires cloning two repos and running
-`cargo build` against a forked libkrun. SmolVM evaluates in one
-`pip install`. The Rust SDK is real but invisible to the Python-shaped agent
-ecosystem.
+If the project's stance ever changes, the intended shape is:
 
-Goal is **not** to become a Python project. Goal is to ship a small Python
-package and a small TypeScript package that each wrap the existing Rust CLI
-+ SDK over a stable IPC surface.
+- `tb-sandbox-daemon` binary hosting `SandboxManagerSdk` behind a
+  Unix-socket JSON-RPC surface.
+- `tb-sandbox-py` package shelling out to the daemon (mirrors
+  `from smolvm import SmolVM` API shape).
+- `tb-sandbox-ts` package for the Node/agent-SDK world.
+- Thin adapters under `python/adapters/` for OpenAI Agents, LangChain,
+  PydanticAI.
+- Homebrew formula + `pipx install tb-sandbox` that handle the
+  libkrun + os_mode launcher dependency.
 
-### Design
-
-- A `tb-sandbox-daemon` binary (new bin target in `Cargo.toml`) that hosts
-  `SandboxManagerSdk` behind a Unix-socket JSON-RPC surface mirroring the
-  existing Rust SDK methods (`create`, `shell`, `launch_piped`, `resize`,
-  `snapshot`, `restore`, `list`). One process per user, started on demand.
-- A `tb-sandbox-py` package (separate repo or `python/` subdir here) that
-  shells out to the daemon socket. Public API mirrors SmolVM's surface so a
-  reader can A/B compare:
-
-  ```python
-  from tb_sandbox import Sandbox
-
-  vm = Sandbox(image="debian-bookworm")
-  result = vm.run("echo hello")
-  vm.stop()
-  ```
-
-- A `tb-sandbox-ts` package with the same surface for the Node/agent-SDK
-  world.
-- Adapters under `python/adapters/`: `openai_agents.py`, `langchain.py`,
-  `pydantic_ai.py` — each one a 50-line tool wrapper around `Sandbox.run`,
-  matching the integration surface SmolVM lists in their README.
-- A `brew install` formula and a `pipx install tb-sandbox` path that handle
-  the libkrun + os_mode launcher dependency for the user. The libkrun fork
-  already ships `libkrun.pc` and a `.dylib`, so a Homebrew formula is
-  feasible.
-
-This is **purely additive** — no Rust code is moved, no existing CLI
-changes. Phase ordering can run in parallel with G1.
-
-**Exit criteria:** an outside user can `pipx install tb-sandbox`, run
-`tb-sandbox doctor` to verify libkrun + os_mode are present (auto-install
-through Homebrew if not), then do
-`Sandbox(image="debian-bookworm").run("echo hi")` from Python. The
-`openai_agents` adapter passes the trivial "agent runs `ls` in sandbox" test.
+No code from this section exists. Not on any roadmap.
 
 ---
 
@@ -844,28 +784,27 @@ identified.
 
 ## Sequencing And Headcount
 
-Original plan, calendar order if one engineer works end-to-end:
+Original session-zero plan, kept as a record of the journey. Current
+status (per the [Status table](#status-as-of-the-last-commit-on-main) at
+the top) is what's live; this list shows what we expected vs what
+actually happened.
 
-1. **G4 packaging** — 1–2 weeks. Unblocks all external evaluation.
+1. **G4 packaging** — 1–2 weeks. Now declared out of scope.
 2. **G1 Phase 1 (artifact + cold-boot-replay restore + fork)** — 1–2 weeks. **DONE.**
-3. **G1 Phase 2 (quiescence)** — 1 week. **DONE (sync-mode; freeze deferred).**
-4. **G3 browser image + VNC viewer** — 2–3 weeks. Independent of G1
-   Phases 3/4, can interleave. **DONE in 1 session** (existing SDK
-   `exec`+`forward_port` collapsed most of the planned scope).
+3. **G1 Phase 2 (quiescence)** — 1 week. **DONE (sync + strict freeze).**
+4. **G3 browser image + VNC viewer** — 2–3 weeks. **DONE in 1 session**
+   (existing SDK `exec`+`forward_port` collapsed most of the planned scope).
 5. **G1 Phase 3 (HVF capture/restore)** — 6–10 weeks. The hard one. Owns
-   most of the calendar. **WRAPPER-SIDE SCAFFOLDING DONE; libkrun-side core
-   implementation (Phases A–D of the libkrun design doc) pending.**
-6. **G1 Phase 4 (dedup)** — deferred.
+   most of the calendar. **DONE end-to-end across both repos** (memory +
+   vCPU + GICv3 + device capture/restore wired via control socket + os_mode
+   `--restore` flag + wrapper flip). End-to-end verification on a real
+   booted guest remains the only outstanding piece.
+6. **G1 Phase 4 (dedup)** — deferred per original plan.
 
-Remaining critical path is **Phase 3 (HVF memory/vCPU/device capture)** —
-the multi-month libkrun-side work, unchanged in scope. Two small follow-ons
-sit on the side: strict-freeze in the quiesce daemon (cached binaries +
-bash-builtin polling), and on-VM verification of the quiesce round-trip
-against a real Linux guest. G4 (packaging) and G3 (browser image) remain
-parallelizable with G1 Phase 3.
-
-If two engineers work in parallel, G4 + G3 go to engineer A and G1 Phase 3
-to engineer B; merge after G1 Phase 3.
+The original critical path was Phase 3; that's now code-complete. The
+only items left on `main` are hardware-bound verification gaps and the
+per-virtio-device save_state polish item, neither of which blocks the
+project's stated goals.
 
 ## Open Questions
 

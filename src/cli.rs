@@ -661,6 +661,7 @@ fn parse_sandbox_config(args: Vec<String>, shell_command: bool) -> Result<Sandbo
     let mut network_proxy_enabled = true;
     let mut tls_mitm = true;
     let mut proxy_header_rules = Vec::new();
+    let mut egress_allowlist: Vec<String> = Vec::new();
     let mut network_backend = env::var_os("TB_SANDBOX_GVPROXY_SOCKET")
         .map(PathBuf::from)
         .map(|socket| NetworkBackend::Gvproxy { socket })
@@ -807,6 +808,14 @@ fn parse_sandbox_config(args: Vec<String>, shell_command: bool) -> Result<Sandbo
                 let spec = next_value(&mut iter, "--proxy-header-env")?;
                 proxy_header_rules.push(parse_proxy_header_env_rule(&spec)?);
             }
+            "--egress-allow" => {
+                // Repeatable; accumulates patterns. Supports comma-separated
+                // shorthand so a single flag can carry the whole set.
+                let value = next_value(&mut iter, "--egress-allow")?;
+                for pattern in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    egress_allowlist.push(pattern.to_string());
+                }
+            }
             "--yes" => yes = true,
             "--log-level" => {
                 let value = next_value(&mut iter, "--log-level")?;
@@ -870,6 +879,7 @@ fn parse_sandbox_config(args: Vec<String>, shell_command: bool) -> Result<Sandbo
     config.network_proxy.enabled = network_proxy_enabled;
     config.network_proxy.tls_mitm = tls_mitm;
     config.network_proxy.header_rules = proxy_header_rules;
+    config.network_proxy.egress_allowlist = egress_allowlist;
     config.network_backend = network_backend;
     Ok(config)
 }
@@ -1074,6 +1084,9 @@ Common options:
   --no-tls-mitm
   --proxy-header HOST:HEADER=VALUE
   --proxy-header-env HOST:HEADER=ENV_NAME
+  --egress-allow PATTERN[,PATTERN...]  Restrict outbound HTTP(S) to listed hosts
+                                       (exact hostname or '*.suffix.example.com');
+                                       repeatable. Default: no restriction.
   --ephemeral
   --initial-command COMMAND
   --yes

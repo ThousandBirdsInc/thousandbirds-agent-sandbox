@@ -193,6 +193,13 @@ impl SnapshotManifest {
             .map(|rule| format!("\"{}\"", escape_json(&rule.encode())))
             .collect::<Vec<_>>()
             .join(", ");
+        let egress = self
+            .network_proxy
+            .egress_allowlist
+            .iter()
+            .map(|pattern| format!("\"{}\"", escape_json(pattern)))
+            .collect::<Vec<_>>()
+            .join(", ");
         format!(
             concat!(
                 "{{\n",
@@ -211,6 +218,7 @@ impl SnapshotManifest {
                 "  \"network_proxy_enabled\": {proxy_enabled},\n",
                 "  \"network_proxy_tls_mitm\": {tls_mitm},\n",
                 "  \"proxy_header_rules\": [{rules}],\n",
+                "  \"egress_allowlist\": [{egress}],\n",
                 "  \"workspace_mounts\": [{mounts}],\n",
                 "  \"had_credentials\": {had_credentials},\n",
                 "  \"quiesced\": {quiesced},\n",
@@ -235,6 +243,7 @@ impl SnapshotManifest {
             proxy_enabled = self.network_proxy.enabled,
             tls_mitm = self.network_proxy.tls_mitm,
             rules = rules,
+            egress = egress,
             mounts = mounts,
             had_credentials = self.had_credentials,
             quiesced = self.quiesced,
@@ -291,6 +300,10 @@ impl SnapshotManifest {
                 enabled: json_bool(json, "network_proxy_enabled").unwrap_or(true),
                 tls_mitm: json_bool(json, "network_proxy_tls_mitm").unwrap_or(true),
                 header_rules,
+                // Snapshot manifests pre-allowlist support set this to
+                // empty — backwards-compatible with the "no restriction"
+                // default.
+                egress_allowlist: json_string_array(json, "egress_allowlist").unwrap_or_default(),
             },
             had_credentials: json_bool(json, "had_credentials").unwrap_or(false),
             quiesced: json_bool(json, "quiesced").unwrap_or(false),
@@ -580,6 +593,7 @@ mod tests {
                     value: "Bearer test".to_string(),
                     value_from_env: false,
                 }],
+                egress_allowlist: vec!["*.example.test".to_string()],
             },
             had_credentials: true,
             quiesced: true,

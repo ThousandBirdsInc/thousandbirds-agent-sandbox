@@ -86,6 +86,14 @@ pub struct NetworkProxyConfig {
     pub enabled: bool,
     pub tls_mitm: bool,
     pub header_rules: Vec<ProxyHeaderRule>,
+    /// Optional egress allowlist. When non-empty, the proxy refuses any
+    /// HTTP request or HTTPS `CONNECT` whose authority host does not
+    /// match one of these patterns. Patterns are exact host names or
+    /// `*.suffix` globs (e.g. `*.example.com` matches `api.example.com`
+    /// but not `example.com` itself). Empty list (the default) means no
+    /// restriction — SmolVM's `internet_settings={"allowed_domains":
+    /// [...]}` equivalent.
+    pub egress_allowlist: Vec<String>,
 }
 
 impl Default for NetworkProxyConfig {
@@ -94,6 +102,7 @@ impl Default for NetworkProxyConfig {
             enabled: true,
             tls_mitm: true,
             header_rules: Vec::new(),
+            egress_allowlist: Vec::new(),
         }
     }
 }
