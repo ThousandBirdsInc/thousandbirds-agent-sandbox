@@ -142,6 +142,11 @@ struct StoredSandbox {
     log_level: crate::config::LogLevel,
     network_proxy: NetworkProxyConfig,
     network_backend: NetworkBackend,
+    /// Snapshot directory to restore from at next launch (gap plan Phase 3).
+    /// Set by `SandboxManager::restore` for sandboxes built from a Full-kind
+    /// snapshot; consumed by `shell`/`launch_piped` to populate
+    /// `LaunchConfig::restore_from`. None for cold-boot sandboxes.
+    restore_source: Option<PathBuf>,
 }
 
 struct ManagedGvproxy {
@@ -303,6 +308,7 @@ impl SandboxManager {
             log_level: config.log_level,
             network_proxy: config.network_proxy.clone(),
             network_backend: config.network_backend.clone(),
+            restore_source: None,
         };
         write_sandbox_metadata(&sandbox_dir.join("sandbox.json"), &stored)?;
 
@@ -385,10 +391,12 @@ impl SandboxManager {
             runtime_control_mount: &stored.runtime_control,
             network_backend: &launch_network_backend,
             log_level: stored.log_level,
-            // Phase 3 plumbing — populated by a future
-            // SandboxManager::restore_with_memory once libkrun lands
-            // --restore. Cold-boot paths leave it None.
-            restore_from: None,
+            // Phase 3: when this sandbox was built from a Full-kind
+            // snapshot, restore_source points at the snapshot dir. The
+            // os_mode launcher passes it as --restore PATH, which makes
+            // libkrun call Vmm::restore_memory_and_vm_state before
+            // spawning vCPUs.
+            restore_from: stored.restore_source.as_deref(),
         })?;
         command
             .stdin(Stdio::inherit())
@@ -471,10 +479,12 @@ impl SandboxManager {
             runtime_control_mount: &stored.runtime_control,
             network_backend: &launch_network_backend,
             log_level: stored.log_level,
-            // Phase 3 plumbing — populated by a future
-            // SandboxManager::restore_with_memory once libkrun lands
-            // --restore. Cold-boot paths leave it None.
-            restore_from: None,
+            // Phase 3: when this sandbox was built from a Full-kind
+            // snapshot, restore_source points at the snapshot dir. The
+            // os_mode launcher passes it as --restore PATH, which makes
+            // libkrun call Vmm::restore_memory_and_vm_state before
+            // spawning vCPUs.
+            restore_from: stored.restore_source.as_deref(),
         })?;
         command
             .stdin(Stdio::null())
@@ -661,36 +671,29 @@ impl SandboxManager {
     /// replays on next boot, but in-flight application writes can be torn.
     pub fn snapshot(&self, id: &SandboxId, opts: SnapshotOptions) -> Result<SnapshotId> {
         let stored = self.load(id)?;
-        // Phase 3 surface check. SnapshotOptions accepts capture_memory: true
-        // today so callers can write against the eventual API, but until the
-        // libkrun-side capture path lands (see
-        // docs/closing-the-smolvm-gap-plan.md Phase 3 and the matching
-        // thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md)
-        // we cannot honor it. Surface a typed error here rather than silently
-        // producing a disk-only snapshot — the caller would otherwise believe
-        // memory was captured.
+        // Phase 3 capture: when capture_memory is true we additionally drive
+        // the libkrun-side `snapshot-memory <path>` control-socket command,
+        // which calls `Vmm::snapshot_to_dir` to write memory + vCPU state
+        // into the same snapshot directory the disk-only path writes. The
+        // sandbox must be running (libkrun's snapshot needs vCPUs to pause)
+        // and must have a control socket (resize headroom configured).
         if opts.capture_memory {
-            // Phase 3 surface check. The wrapper-side surface is wired
-            // through (SnapshotOptions::capture_memory, manifest's `Full`
-            // kind, LaunchConfig::restore_from for the reverse path). The
-            // libkrun side ships `krun_snapshot_to_path` as a reserved C
-            // ABI symbol that returns -ENOSYS until the vCPU-thread
-            // orchestration lands — see
-            // `../thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md`
-            // (Phase D). When that ships, this branch flips from "return
-            // typed error" to "send snapshot-memory RPC over the control
-            // socket". No shape change required.
-            return Err(Error::InvalidArgument(format!(
-                "snapshot of sandbox {id} requested capture_memory=true, but the \
-                 libkrun snapshot orchestration is -ENOSYS in this build. The \
-                 wrapper-side plumbing is in place; the libkrun-side C API \
-                 symbols (krun_snapshot_to_path / krun_set_snapshot_restore_from) \
-                 are reserved and the type surface compiled, awaiting vCPU-thread \
-                 Pause+Snapshot event orchestration. Track: \
-                 docs/closing-the-smolvm-gap-plan.md Phase 3 + \
-                 ../thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md \
-                 §Phase D."
-            )));
+            if !self.is_running(id) {
+                return Err(Error::InvalidArgument(format!(
+                    "snapshot of sandbox {id} requested capture_memory=true, but the \
+                     sandbox is not running. Memory capture needs a live VM whose \
+                     vCPUs can be paused. Start the sandbox first, or omit \
+                     capture_memory for a disk-only snapshot."
+                )));
+            }
+            if stored.memory_max_mib <= stored.memory_mib {
+                return Err(Error::InvalidArgument(format!(
+                    "snapshot of sandbox {id} requested capture_memory=true, but the \
+                     sandbox was created without a control socket (no resize \
+                     headroom). Recreate with `--memory-max-mib > --memory-mib` so \
+                     libkrun's runtime control socket is wired up."
+                )));
+            }
         }
         let snap_id = match opts.name {
             Some(name) => SnapshotId::new(sanitize_id(&name))?,
@@ -751,9 +754,37 @@ impl SandboxManager {
                 _ => false,
             };
 
+            // Phase 3 memory capture: when capture_memory is set, drive
+            // libkrun's `snapshot-memory <path>` command over the existing
+            // runtime-control socket. libkrun's listener (now extended to
+            // dispatch snapshot-memory in addition to balloon target-mib)
+            // pauses vCPUs, calls Vmm::snapshot_to_dir, resumes. The files
+            // (snapshot.bin, vcpu_NNN.bin, memory.bin) land alongside the
+            // root.raw we cloned above.
+            let (kind, memory_image_path) = if opts.capture_memory {
+                let socket = self.control_socket_path(id);
+                if !socket.exists() {
+                    return Err(Error::NotFound(format!(
+                        "control socket for sandbox {id} not found at {}; \
+                         capture_memory requires a running sandbox with a control socket",
+                        socket.display()
+                    )));
+                }
+                let cmd = format!("snapshot-memory {}", snap_dir.display());
+                let response = send_control_command(&socket, &cmd)?;
+                if !response.starts_with("ok") {
+                    return Err(Error::Internal(format!(
+                        "libkrun snapshot-memory rejected: {response}"
+                    )));
+                }
+                (SnapshotKind::Full, Some(PathBuf::from("memory.bin")))
+            } else {
+                (SnapshotKind::DiskOnly, None)
+            };
+
             let manifest = SnapshotManifest {
                 version: 1,
-                kind: SnapshotKind::DiskOnly,
+                kind,
                 id: snap_id.clone(),
                 parent_sandbox_id: id.as_str().to_string(),
                 created_unix_millis: unix_millis(),
@@ -774,10 +805,7 @@ impl SandboxManager {
                     None
                 },
                 quiesced_unix_millis: achieved_unix_millis,
-                // Phase 3 (memory capture) lands this as Some(path) when
-                // the libkrun side ships. Today's disk-only path leaves it
-                // None; the manifest's `kind` stays `disk-only`.
-                memory_image_path: None,
+                memory_image_path,
             };
             let manifest_path = snap_dir.join("manifest.json");
             fs::write(&manifest_path, manifest.to_json())
@@ -809,29 +837,20 @@ impl SandboxManager {
         let manifest_json = fs::read_to_string(&manifest_path)
             .map_err(|err| Error::io_path(&manifest_path, err))?;
         let manifest = SnapshotManifest::from_json(&manifest_json)?;
-        // Phase 3 symmetry: a Full-kind snapshot expects the wrapper to
-        // route the launcher invocation through LaunchConfig::restore_from
-        // so libkrun rebuilds vCPU + memory state instead of cold-booting.
-        // The wrapper-side plumbing is in place
-        // (src/libkrun.rs LaunchConfig::restore_from emits --restore PATH),
-        // and the libkrun-side C ABI symbol `krun_set_snapshot_restore_from`
-        // is reserved, but the actual restore execution in libkrun is
-        // pending (returns -ENOSYS until the orchestration ships). Refuse
-        // here rather than silently cold-booting from the snapshot's disk
-        // and discarding the captured memory — that would deceive the
-        // caller into believing they got a process-preserving restore.
-        if manifest.kind == SnapshotKind::Full {
-            return Err(Error::InvalidArgument(format!(
-                "snapshot {snap_id} is a Full-kind (memory + vCPU state) artifact \
-                 but this build cannot yet restore from it: libkrun's runtime \
-                 restore execution is -ENOSYS. The wrapper-side plumbing is in \
-                 place (LaunchConfig::restore_from emits --restore PATH to the \
-                 launcher; the C ABI symbol krun_set_snapshot_restore_from is \
-                 reserved). Track: \
-                 ../thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md \
-                 §Phase D."
-            )));
-        }
+        // Phase 3 Full restore: the wrapper marks the new sandbox with
+        // `restore_source = Some(snapshot_dir)`. On next `shell` or
+        // `launch_piped` the launcher invocation gets `--restore PATH`,
+        // which causes libkrun to call Vmm::restore_memory_and_vm_state
+        // (replays memory + VM-level state into the freshly built VM) and
+        // Vmm::apply_vcpu_state_to_handles (replays per-vCPU register
+        // state via the VcpuEvent::Restore path). The disk clone is still
+        // taken below; it provides the block device the restored guest
+        // expects, matching the snapshot's checksum.
+        let restore_source_for_full = if manifest.kind == SnapshotKind::Full {
+            Some(snap_dir.clone())
+        } else {
+            None
+        };
 
         let new_id = match &opts.name {
             Some(name) => SandboxId::new(sanitize_id(name))?,
@@ -910,6 +929,10 @@ impl SandboxManager {
                 log_level: config.log_level,
                 network_proxy: config.network_proxy.clone(),
                 network_backend: config.network_backend.clone(),
+                // Disk-only restore: cold-boot. Full-kind restore sets
+                // restore_source so the next launch passes --restore PATH
+                // and libkrun rebuilds memory + vCPU state.
+                restore_source: restore_source_for_full.clone(),
             };
             write_sandbox_metadata(&sandbox_dir.join("sandbox.json"), &stored)?;
 
@@ -1026,6 +1049,10 @@ impl SandboxManager {
                 log_level: parent.log_level,
                 network_proxy: parent.network_proxy.clone(),
                 network_backend: parent.network_backend.clone(),
+                // Fork copies the parent's disk; the new sandbox cold-boots
+                // from it just like a normal create. (Memory snapshots of
+                // a forked sandbox follow the same snapshot+restore path.)
+                restore_source: None,
             };
             write_sandbox_metadata(&sandbox_dir.join("sandbox.json"), &stored)?;
 
@@ -1146,6 +1173,9 @@ impl SandboxManager {
                 header_rules: parse_proxy_header_rules(&json)?,
             },
             network_backend: parse_network_backend(&json)?,
+            restore_source: json_string(&json, "restore_source")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
         })
     }
 }
@@ -1719,6 +1749,7 @@ fn write_sandbox_metadata(path: &Path, stored: &StoredSandbox) -> Result<()> {
             "  \"network_proxy_tls_mitm\": {},\n",
             "  \"network_backend\": \"{}\",\n",
             "  \"proxy_header_rules\": [{}],\n",
+            "  \"restore_source\": \"{}\",\n",
             "  \"workspace_mounts\": [{}]\n",
             "}}\n"
         ),
@@ -1744,6 +1775,13 @@ fn write_sandbox_metadata(path: &Path, stored: &StoredSandbox) -> Result<()> {
             .map(|rule| format!("\"{}\"", crate::credentials::escape_json(&rule.encode())))
             .collect::<Vec<_>>()
             .join(", "),
+        crate::credentials::escape_json(
+            &stored
+                .restore_source
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        ),
         mounts
             .iter()
             .map(|mount| format!("\"{}\"", crate::credentials::escape_json(mount)))
@@ -2493,11 +2531,12 @@ mod tests {
     // -- Phase 3 surface (memory snapshot) -----------------------------------
 
     #[test]
-    fn restore_of_full_kind_snapshot_returns_typed_error_today() {
-        // Phase 3 symmetric guard: a Full-kind manifest (memory snapshot)
-        // is refused at restore time rather than silently cold-booting
-        // from the disk and discarding the captured memory.
-        let (manager, image) = snapshot_fixture("restore-full-unimplemented");
+    fn restore_of_full_kind_snapshot_sets_restore_source_on_new_sandbox() {
+        // Phase 3 wired: a Full-kind manifest produces a restored sandbox
+        // whose StoredSandbox.restore_source points at the snapshot dir.
+        // On next `shell`/`launch_piped` the launcher gets --restore PATH,
+        // which makes libkrun rebuild memory + vCPU state.
+        let (manager, image) = snapshot_fixture("restore-full-wired");
         let mut config = SandboxConfig::new(AgentImageRef::new(&image));
         config.name = Some("src".to_string());
         let sandbox = manager.create(config).unwrap();
@@ -2505,14 +2544,17 @@ mod tests {
             .snapshot(
                 &sandbox.id,
                 SnapshotOptions {
-                    name: Some("masquerade".to_string()),
+                    name: Some("masq".to_string()),
                     ..Default::default()
                 },
             )
             .unwrap();
 
-        // Forge a Full-kind manifest on disk — simulates a snapshot
-        // captured by a future libkrun that supports memory capture.
+        // Forge a Full-kind manifest. A real Full snapshot would also have
+        // snapshot.bin / vcpu_NNN.bin / memory.bin alongside; the wrapper
+        // doesn't validate that — libkrun will fail at restore-time if the
+        // files are missing, but the wrapper-side metadata + restore_source
+        // wiring is what this test verifies.
         let manifest_path = manager.snapshot_dir(&snap_id).join("manifest.json");
         let json = fs::read_to_string(&manifest_path).unwrap();
         let forged = json
@@ -2523,24 +2565,39 @@ mod tests {
             );
         fs::write(&manifest_path, forged).unwrap();
 
-        let err = manager
-            .restore(&snap_id, RestoreOptions::default())
-            .expect_err("restore of Full-kind should fail loudly today");
+        let new = manager
+            .restore(
+                &snap_id,
+                RestoreOptions {
+                    name: Some("restored-full".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("restore of Full-kind should succeed at wrapper level");
+        let json = manager.inspect(&new.id).unwrap();
         assert!(
-            err.to_string().contains("Full-kind") && err.to_string().contains("ENOSYS"),
-            "got: {err}"
+            json.contains(&format!(
+                "\"restore_source\": \"{}\"",
+                manager
+                    .snapshot_dir(&snap_id)
+                    .display()
+                    .to_string()
+                    .replace('\\', "\\\\")
+            )),
+            "restore_source not persisted in sandbox metadata; got: {json}"
         );
     }
 
     #[test]
-    fn snapshot_with_capture_memory_returns_typed_error_today() {
-        // Phase 3 forward-compat: callers can set capture_memory=true now;
-        // the wrapper surfaces a clean error pointing at the gap plan
-        // rather than silently downgrading to a disk-only snapshot.
-        let (manager, image) = snapshot_fixture("capture-memory-unimplemented");
+    fn snapshot_with_capture_memory_requires_running_sandbox() {
+        // capture_memory needs a live VM (libkrun pauses vCPUs to capture).
+        // Stopped sandboxes are refused with a clear message rather than
+        // attempting a control-socket call to a socket that doesn't exist.
+        let (manager, image) = snapshot_fixture("capture-memory-stopped");
         let mut config = SandboxConfig::new(AgentImageRef::new(&image));
         config.name = Some("src".to_string());
         let sandbox = manager.create(config).unwrap();
+        // Not started; is_running == false.
 
         let err = manager
             .snapshot(
@@ -2550,13 +2607,13 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .expect_err("capture_memory should surface unimplemented today");
+            .expect_err("capture_memory of stopped sandbox should fail");
         let msg = err.to_string();
         assert!(
-            msg.contains("capture_memory") && msg.contains("Phase 3"),
-            "got: {msg}"
+            msg.contains("not running"),
+            "expected 'not running' message; got: {msg}"
         );
-        // No snapshot artifact was created.
+        // No snapshot artifact was left behind.
         let snapshots_dir = manager.state_root.join("snapshots");
         if snapshots_dir.exists() {
             assert!(
@@ -2564,6 +2621,35 @@ mod tests {
                 "no snapshot dirs should be left behind on error"
             );
         }
+    }
+
+    #[test]
+    fn snapshot_with_capture_memory_requires_resize_headroom() {
+        // capture_memory needs the runtime control socket, which only
+        // exists when the sandbox was created with --memory-max-mib >
+        // --memory-mib. A "running" sandbox without headroom is refused
+        // up front with a precise message.
+        let (manager, image) = snapshot_fixture("capture-memory-no-socket");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        // memory_mib == memory_max_mib by default → no resize headroom.
+        let sandbox = manager.create(config).unwrap();
+        mark_running(&manager, &sandbox);
+
+        let err = manager
+            .snapshot(
+                &sandbox.id,
+                SnapshotOptions {
+                    capture_memory: true,
+                    ..Default::default()
+                },
+            )
+            .expect_err("capture_memory without resize headroom should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("control socket") || msg.contains("memory-max-mib"),
+            "expected 'control socket' or '--memory-max-mib' message; got: {msg}"
+        );
     }
 
     #[test]
