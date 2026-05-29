@@ -12,6 +12,120 @@ Like the density doc, items tagged **[repo]** land here; items tagged **[krun]**
 land in `../thousandbirds-libkrun` and are surfaced through launcher flags and
 public APIs.
 
+## Status (as of the last commit on `main`)
+
+The bulk of the planned work has shipped across both repos. The table below
+is the at-a-glance state; per-gap sections further down still document the
+full design intent and the remaining sub-items.
+
+| Gap | Status | Commit(s) |
+|---|---|---|
+| **G1 Phase 1** disk-state snapshot/restore + VM forking | ✅ DONE | wrapper `6ec6f9a` |
+| **G1 Phase 2** cooperative quiesce (sync-mode) | ✅ DONE | wrapper `19e7ebf` |
+| **G1 Phase 3** memory + vCPU + GICv3 + device capture/restore | ✅ CODE COMPLETE | libkrun `69fc1cd`→`ec9c5d8`, wrapper `d59c83a`→`d2a46fd` |
+| **G3** browser-in-sandbox (Chromium + CDP + VNC) | ✅ DONE | wrapper `98dc854` |
+| **G4** packaging + framework adapters | ⏳ NOT STARTED | — |
+| **G2** Windows guests | ⛔ DECLINED (would require abandoning HVF-direct libkrun) | — |
+| **G5** cross-host snapshot portability | ⛔ DECLINED (per libkrun snapshot contract) | — |
+
+Tests across both repos: 62 wrapper + 35 libkrun = 97 passing, 0 failing.
+
+## Remaining Work
+
+Ordered by leverage. Each item is bounded — none requires another month of
+design work.
+
+### 1. G4 — packaging + framework adapters [~1–2 weeks, untouched]
+
+**The single biggest gap that determines whether anyone outside this repo
+can evaluate this project against SmolVM.** Today: clone two repos, run
+`cargo build`, build a libkrun image bundle, then call the Rust SDK. SmolVM
+is `pip install smolvm`.
+
+Plan (see [G4 design section](#g4--packaging--framework-adapters) below for
+detail):
+
+- New `tb-sandbox-daemon` binary that hosts `SandboxManagerSdk` behind a
+  Unix-socket JSON-RPC surface.
+- `tb-sandbox-py` package (mirrors `from smolvm import SmolVM` shape).
+- `tb-sandbox-ts` package for the Node/agent-SDK world.
+- `python/adapters/` thin shims for OpenAI Agents, LangChain, PydanticAI.
+- `brew install` formula + `pipx install tb-sandbox` install path that
+  handles the libkrun + os_mode launcher dependency.
+
+### 2. G1 — end-to-end verification on real guests [hardware-bound, ~½ day each]
+
+The Phase 3 code is wired end-to-end across both repos, but the actual
+round-trip has not been booted in this environment (no os_mode_artifacts
+bundle on this dev machine, no `/dev/kvm` for the Linux path):
+
+- **HVF aarch64 round-trip:** boot an os_mode Debian guest with the
+  browser variant, write a memory marker pattern + a file, send
+  `snapshot-memory PATH` over the control socket, exit, restore from
+  that path, verify the marker pattern and file content survive,
+  verify `uptime` resumes from snapshot point not zero.
+- **KVM x86_64 round-trip** on a Linux host with `/dev/kvm`.
+
+Both are bounded test gaps against complete code paths.
+
+### 3. G1 — bounded follow-ons (snapshot polish)
+
+These are small, well-scoped extensions to the snapshot/restore code
+already on `main`:
+
+- **Phase 2 strict-freeze** in `guest/agent-sandbox-quiesce` — currently
+  downgrades `fsfreeze -f /` to `sync` because driving fsfreeze from a
+  daemon hosted on the frozen rootfs would deadlock the daemon's own
+  `sleep`. Fix: cache `/bin/sleep` and `/sbin/fsfreeze` in `/run`
+  (tmpfs), use `read -t` on a fifo as a sleep substitute. ~50 lines of
+  shell + a test. Documented downgrade lives in the daemon today so
+  manifests don't lie.
+- **HVF GICv3 register-set extension** in
+  `../thousandbirds-libkrun/src/hvf/src/lib.rs`. `HVF_GIC_DISTRIBUTOR_REG_IDS`
+  currently captures only `GICD_CTLR` (the global enable). Adding
+  `ISENABLER` / `ICENABLER` / `IPRIORITYR` / `ICFGR` / `IROUTER` is
+  mechanical (~30 minutes) once an interrupt-heavy guest workload
+  proves the minimal set is insufficient.
+- **Per-virtio-device save_state/restore_state** on the virtio device
+  trait in libkrun (virtio-blk, virtio-net, virtio-fs, balloon, mmio
+  transport). The current snapshot captures vCPU + GIC + memory but not
+  in-flight virtio request state. Wrapper-level cooperative quiesce
+  (sync + drain) makes this safe in practice for the agent workloads
+  this repo targets; persistent virtio queue state is a bounded
+  follow-on (~1–2 weeks for full coverage) needed only if snapshots
+  are taken without quiesce.
+- **G1 Phase 4** content-addressed memory chunk dedup. Deferred per the
+  original plan; only worth doing once Phase 3 is in production use.
+
+### 4. Minor — egress allowlist
+
+SmolVM has `internet_settings={"allowed_domains": [...]}` for domain-level
+egress restriction. We have header-substitution rules in `src/proxy.rs`;
+an allowlist mode would be a small extension (~½ day) that refuses
+`CONNECT` to hosts not on the list.
+
+## Suggested ordering
+
+If the goal is **make this comparable to SmolVM in market positioning**:
+
+1. G4 packaging (1–2 weeks) — unblocks any external evaluation
+2. G1 end-to-end verification on real guest (½ day to one week, hardware
+   dependent) — turns "code shipped" into "demoably works"
+3. Per-virtio-device save_state for production-grade snapshot correctness
+4. Phase 2 strict-freeze
+5. GICv3 register-set extension (only if needed)
+
+If the goal is **make snapshot/restore production-trustworthy first**:
+
+1. End-to-end verification on real guest
+2. Per-virtio-device save_state
+3. GICv3 register-set extension
+4. Phase 2 strict-freeze
+5. Phase 4 dedup
+6. G4 packaging
+
+---
+
 ## Gap Inventory (From The Comparison)
 
 | # | SmolVM has | We have | Leverage | Effort |
@@ -22,7 +136,12 @@ public APIs.
 | G4 | **Managed install** (`pip install smolvm`, curl-bash) and framework adapters (OpenAI Agents, LangChain, PydanticAI) | Source build of two Rust repos; Rust SDK only | Medium (adoption) | Low |
 | G5 | **Cross-host snapshot portability** (implied by their pause/resume product surface) | N/A — same gap as G1 plus host portability | Low | Very high |
 
-## Prioritization
+## Prioritization (original — superseded by [Status](#status-as-of-the-last-commit-on-main) above)
+
+The original session-zero ordering. Kept here so future readers can see
+the reasoning that drove the work. The actual outcome — captured in the
+Status table at the top — is that G1 (all phases), G3, and the density-doc
+items all shipped in this session; G4 remains.
 
 **Do (in order):**
 1. **G1 — snapshot / fast restore.** This is the only gap that changes the
