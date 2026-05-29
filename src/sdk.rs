@@ -281,7 +281,10 @@ fn reclaim_scan(manager: &SandboxManager) -> Result<Vec<ReclaimCandidate>> {
         if !manager.control_socket_path(&summary.id).exists() {
             continue;
         }
-        let busy = active_session_pid(&summary.state_dir).ok().flatten().is_some()
+        let busy = active_session_pid(&summary.state_dir)
+            .ok()
+            .flatten()
+            .is_some()
             || has_live_processes(&summary.state_dir);
         out.push(ReclaimCandidate {
             id: summary.id,
@@ -1217,7 +1220,11 @@ async fn tail_response_lines(path: PathBuf, tx: mpsc::Sender<String>, status_pat
                 if line.last() == Some(&b'\r') {
                     line.pop();
                 }
-                if tx.send(String::from_utf8_lossy(&line).into_owned()).await.is_err() {
+                if tx
+                    .send(String::from_utf8_lossy(&line).into_owned())
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -1234,12 +1241,18 @@ async fn tail_response_lines(path: PathBuf, tx: mpsc::Sender<String>, status_pat
                 if line.last() == Some(&b'\r') {
                     line.pop();
                 }
-                if tx.send(String::from_utf8_lossy(&line).into_owned()).await.is_err() {
+                if tx
+                    .send(String::from_utf8_lossy(&line).into_owned())
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
             if !pending.is_empty() {
-                let _ = tx.send(String::from_utf8_lossy(&pending).into_owned()).await;
+                let _ = tx
+                    .send(String::from_utf8_lossy(&pending).into_owned())
+                    .await;
             }
             break;
         }
@@ -1448,7 +1461,12 @@ while True:
 fn translate_guest_paths_to_host(command: &mut GuestCommand, mounts: &[WorkspaceMountInfo]) {
     let mut map: Vec<(String, String)> = mounts
         .iter()
-        .map(|mount| (mount.guest_path.clone(), mount.host_path.display().to_string()))
+        .map(|mount| {
+            (
+                mount.guest_path.clone(),
+                mount.host_path.display().to_string(),
+            )
+        })
         .collect();
     map.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 

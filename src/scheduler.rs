@@ -243,7 +243,10 @@ fn host_memory_mib() -> Option<u64> {
     if !output.status.success() {
         return None;
     }
-    let bytes: u64 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+    let bytes: u64 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
     Some(bytes / (1024 * 1024))
 }
 
@@ -325,7 +328,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let l = ledger(&root, Some(4096));
         // Record a live reservation for the current process (definitely alive).
-        l.record_running(&dir, "a", std::process::id(), 3072).unwrap();
+        l.record_running(&dir, "a", std::process::id(), 3072)
+            .unwrap();
         assert_eq!(l.reserved_mib_excluding("other"), 3072);
         // 3072 reserved + 2048 want > 4096 budget -> rejected.
         assert!(matches!(
