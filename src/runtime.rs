@@ -1,5 +1,6 @@
 use crate::config::{
-    NetworkBackend, NetworkProxyConfig, ProxyHeaderRule, SandboxConfig, WorkspaceMount,
+    AgentImageRef, NetworkBackend, NetworkProxyConfig, ProxyHeaderRule, SandboxConfig, ShellConfig,
+    WorkspaceMount,
 };
 use crate::credentials::{prepare_credentials, PreparedCredentials};
 use crate::error::{Error, Result};
@@ -7,6 +8,10 @@ use crate::image::{json_bool, json_number, json_string, json_string_array, Agent
 use crate::libkrun::{launch_command, LaunchConfig};
 use crate::proxy::NetworkProxy;
 use crate::scheduler::ResourceLedger;
+use crate::snapshot::{
+    config_from_manifest, snapshot_dir as snapshot_dir_path, ForkOptions, RestoreOptions,
+    SnapshotId, SnapshotKind, SnapshotManifest, SnapshotOptions, SnapshotSummary,
+};
 use std::env;
 use std::fs;
 use std::net::TcpListener;
@@ -310,8 +315,7 @@ impl SandboxManager {
         let stored = self.load(id)?;
         // Admission control: refuse (or queue) if starting this VM would exceed
         // the host memory budget. Done before any gvproxy/proxy side effects.
-        ResourceLedger::from_env(&self.state_root)
-            .admit(id.as_str(), stored.memory_mib as u64)?;
+        ResourceLedger::from_env(&self.state_root).admit(id.as_str(), stored.memory_mib as u64)?;
         let image = AgentImage::load(&stored.image_path)?;
         write_terminal_env(&stored.runtime_config)?;
         let managed_gvproxy = match &stored.network_backend {
@@ -414,8 +418,7 @@ impl SandboxManager {
 
     pub fn launch_piped(&self, id: &SandboxId) -> Result<RunningSandboxLaunch> {
         let stored = self.load(id)?;
-        ResourceLedger::from_env(&self.state_root)
-            .admit(id.as_str(), stored.memory_mib as u64)?;
+        ResourceLedger::from_env(&self.state_root).admit(id.as_str(), stored.memory_mib as u64)?;
         let image = AgentImage::load(&stored.image_path)?;
         write_terminal_env(&stored.runtime_config)?;
         let managed_gvproxy = match &stored.network_backend {
@@ -635,6 +638,371 @@ impl SandboxManager {
         Ok(summaries)
     }
 
+    /// Capture a sandbox's root disk and configuration into an immutable
+    /// artifact under `<state>/snapshots/<snapshot_id>/`. The snapshot is
+    /// **disk-only**: guest memory, vCPU state, and live processes are not
+    /// preserved — `restore` cold-boots from the snapshotted disk.
+    ///
+    /// Snapshotting a running sandbox produces a crash-consistent disk image
+    /// (filesystem journal replays on next boot). For correctness across the
+    /// boundary, snapshot a stopped sandbox.
+    pub fn snapshot(&self, id: &SandboxId, opts: SnapshotOptions) -> Result<SnapshotId> {
+        let stored = self.load(id)?;
+        let snap_id = match opts.name {
+            Some(name) => SnapshotId::new(sanitize_id(&name))?,
+            None => SnapshotId::new(format!("snapshot-{}", unix_millis()))?,
+        };
+        let snap_dir = self.snapshot_dir(&snap_id);
+        if snap_dir.exists() {
+            return Err(Error::InvalidArgument(format!(
+                "snapshot {} already exists at {}",
+                snap_id,
+                snap_dir.display()
+            )));
+        }
+        let snapshots_root = self.state_root.join("snapshots");
+        fs::create_dir_all(&snapshots_root).map_err(|err| Error::io_path(&snapshots_root, err))?;
+        fs::create_dir(&snap_dir).map_err(|err| Error::io_path(&snap_dir, err))?;
+
+        let outcome = (|| -> Result<()> {
+            // Clone the root disk. On macOS this is an APFS copy-on-write
+            // clone (~5 ms regardless of disk size).
+            let root_dst = snap_dir.join("root.raw");
+            clone_or_copy_root(&stored.root_disk, &root_dst)?;
+
+            // Bundle credentials staging so a later restore can mount the
+            // same auth material without re-reading host secrets.
+            let had_credentials = match &stored.credentials_staging {
+                Some(src) if src.exists() => {
+                    let dst = snap_dir.join("credentials-staging");
+                    copy_dir_recursive(src, &dst)?;
+                    true
+                }
+                _ => false,
+            };
+
+            let manifest = SnapshotManifest {
+                version: 1,
+                kind: SnapshotKind::DiskOnly,
+                id: snap_id.clone(),
+                parent_sandbox_id: id.as_str().to_string(),
+                created_unix_millis: unix_millis(),
+                image_path: stored.image_path.clone(),
+                cpus: stored.cpus,
+                memory_mib: stored.memory_mib,
+                memory_max_mib: stored.memory_max_mib,
+                memory_min_mib: stored.memory_min_mib,
+                virtiofs_dax_size: stored.virtiofs_dax_size,
+                workspace_mounts: stored.workspace_mounts.clone(),
+                network_backend: stored.network_backend.clone(),
+                network_proxy: stored.network_proxy.clone(),
+                had_credentials,
+            };
+            let manifest_path = snap_dir.join("manifest.json");
+            fs::write(&manifest_path, manifest.to_json())
+                .map_err(|err| Error::io_path(manifest_path, err))?;
+            Ok(())
+        })();
+
+        match outcome {
+            Ok(()) => Ok(snap_id),
+            Err(err) => {
+                let _ = fs::remove_dir_all(&snap_dir);
+                Err(err)
+            }
+        }
+    }
+
+    /// Create a fresh sandbox whose root disk starts from a snapshot. The
+    /// restored sandbox is a cold boot from the snapshotted disk — guest
+    /// memory and live processes are not preserved.
+    ///
+    /// `opts` overrides the snapshot manifest field-by-field. Unset fields
+    /// inherit from the snapshot.
+    pub fn restore(&self, snap_id: &SnapshotId, opts: RestoreOptions) -> Result<Sandbox> {
+        let snap_dir = self.snapshot_dir(snap_id);
+        if !snap_dir.exists() {
+            return Err(Error::NotFound(format!("snapshot {snap_id}")));
+        }
+        let manifest_path = snap_dir.join("manifest.json");
+        let manifest_json = fs::read_to_string(&manifest_path)
+            .map_err(|err| Error::io_path(&manifest_path, err))?;
+        let manifest = SnapshotManifest::from_json(&manifest_json)?;
+
+        let new_id = match &opts.name {
+            Some(name) => SandboxId::new(sanitize_id(name))?,
+            None => SandboxId::new(format!("restore-{}", unix_millis()))?,
+        };
+        let sandbox_dir = self.sandbox_dir(&new_id);
+        if sandbox_dir.exists() {
+            return Err(Error::InvalidArgument(format!(
+                "sandbox {} already exists at {}",
+                new_id,
+                sandbox_dir.display()
+            )));
+        }
+        let sandboxes_root = self.state_root.join("sandboxes");
+        fs::create_dir_all(&sandboxes_root).map_err(|err| Error::io_path(&sandboxes_root, err))?;
+        fs::create_dir(&sandbox_dir).map_err(|err| Error::io_path(&sandbox_dir, err))?;
+
+        let mut config = config_from_manifest(&manifest, &opts);
+        // The runtime-config wants a name; default to the new sandbox id when
+        // the caller did not override it via `opts.name`.
+        if config.name.is_none() {
+            config.name = Some(new_id.as_str().to_string());
+        }
+        let image = AgentImage::load(&manifest.image_path)?;
+
+        let outcome = (|| -> Result<Sandbox> {
+            let root_disk = sandbox_dir.join("root.raw");
+            // Clone the snapshot's root, not the image's. APFS CoW shares
+            // blocks with the snapshot until either side writes.
+            clone_or_copy_root(&snap_dir.join("root.raw"), &root_disk)?;
+
+            let runtime_config = sandbox_dir.join("runtime-config");
+            fs::create_dir_all(&runtime_config)
+                .map_err(|err| Error::io_path(&runtime_config, err))?;
+            write_runtime_config(&runtime_config, &config, &image)?;
+            let runtime_control = sandbox_dir.join("runtime-control");
+            fs::create_dir_all(&runtime_control)
+                .map_err(|err| Error::io_path(&runtime_control, err))?;
+            #[cfg(unix)]
+            {
+                let mut permissions = fs::metadata(&runtime_control)
+                    .map_err(|err| Error::io_path(&runtime_control, err))?
+                    .permissions();
+                permissions.set_mode(0o777);
+                fs::set_permissions(&runtime_control, permissions)
+                    .map_err(|err| Error::io_path(&runtime_control, err))?;
+            }
+
+            let credentials_staging = if manifest.had_credentials && !opts.drop_credentials {
+                let src = snap_dir.join("credentials-staging");
+                if src.exists() {
+                    let dst = sandbox_dir.join("credentials-staging");
+                    copy_dir_recursive(&src, &dst)?;
+                    Some(dst)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let stored = StoredSandbox {
+                id: new_id.clone(),
+                image_path: image.root.clone(),
+                root_disk,
+                cpus: config.cpus,
+                memory_mib: config.memory_mib,
+                memory_max_mib: config.memory_max_mib,
+                memory_min_mib: config.memory_min_mib,
+                virtiofs_dax_size: config.virtiofs_dax_size,
+                workspace_mounts: config.workspace_mounts.clone(),
+                credentials_staging,
+                runtime_config,
+                runtime_control,
+                ephemeral: config.ephemeral,
+                log_level: config.log_level,
+                network_proxy: config.network_proxy.clone(),
+                network_backend: config.network_backend.clone(),
+            };
+            write_sandbox_metadata(&sandbox_dir.join("sandbox.json"), &stored)?;
+
+            Ok(Sandbox {
+                id: new_id.clone(),
+                state_dir: sandbox_dir.clone(),
+            })
+        })();
+
+        match outcome {
+            Ok(sandbox) => Ok(sandbox),
+            Err(err) => {
+                let _ = fs::remove_dir_all(&sandbox_dir);
+                Err(err)
+            }
+        }
+    }
+
+    /// Branch a sandbox: produce a sibling whose root disk starts from a
+    /// (crash-consistent) copy of the parent's at fork time, and whose
+    /// configuration — hardware, workspace, credentials, network — is
+    /// inherited from the parent.
+    ///
+    /// Composes snapshot+restore in memory but persists no intermediate
+    /// artifact under `<state>/snapshots/`. Use `snapshot` + `restore`
+    /// separately when you want a reusable checkpoint.
+    pub fn fork(&self, parent_id: &SandboxId, opts: ForkOptions) -> Result<Sandbox> {
+        let parent = self.load(parent_id)?;
+        let image = AgentImage::load(&parent.image_path)?;
+
+        let new_id = match &opts.name {
+            Some(name) => SandboxId::new(sanitize_id(name))?,
+            None => SandboxId::new(format!("{}-fork-{}", parent_id.as_str(), unix_millis()))?,
+        };
+        let sandbox_dir = self.sandbox_dir(&new_id);
+        if sandbox_dir.exists() {
+            return Err(Error::InvalidArgument(format!(
+                "sandbox {} already exists at {}",
+                new_id,
+                sandbox_dir.display()
+            )));
+        }
+        let sandboxes_root = self.state_root.join("sandboxes");
+        fs::create_dir_all(&sandboxes_root).map_err(|err| Error::io_path(&sandboxes_root, err))?;
+        fs::create_dir(&sandbox_dir).map_err(|err| Error::io_path(&sandbox_dir, err))?;
+
+        let workspace_mounts = opts
+            .workspace_mounts
+            .clone()
+            .unwrap_or_else(|| parent.workspace_mounts.clone());
+
+        let outcome = (|| -> Result<Sandbox> {
+            let root_disk = sandbox_dir.join("root.raw");
+            clone_or_copy_root(&parent.root_disk, &root_disk)?;
+
+            let runtime_config = sandbox_dir.join("runtime-config");
+            fs::create_dir_all(&runtime_config)
+                .map_err(|err| Error::io_path(&runtime_config, err))?;
+            // Synthesize a SandboxConfig matching the parent so the runtime
+            // config emits the same guest-side env. ShellConfig defaults
+            // (agent user, /workspace, /bin/bash) match every existing
+            // sandbox; nothing in StoredSandbox overrides them.
+            let mut config = SandboxConfig::new(AgentImageRef::new(image.root.clone()));
+            config.name = Some(new_id.as_str().to_string());
+            config.cpus = parent.cpus;
+            config.memory_mib = parent.memory_mib;
+            config.memory_max_mib = parent.memory_max_mib;
+            config.memory_min_mib = parent.memory_min_mib;
+            config.virtiofs_dax_size = parent.virtiofs_dax_size;
+            config.workspace_mounts = workspace_mounts.clone();
+            config.network_proxy = parent.network_proxy.clone();
+            config.network_backend = parent.network_backend.clone();
+            config.ephemeral = opts.ephemeral;
+            config.log_level = parent.log_level;
+            config.shell = ShellConfig::default();
+            write_runtime_config(&runtime_config, &config, &image)?;
+
+            let runtime_control = sandbox_dir.join("runtime-control");
+            fs::create_dir_all(&runtime_control)
+                .map_err(|err| Error::io_path(&runtime_control, err))?;
+            #[cfg(unix)]
+            {
+                let mut permissions = fs::metadata(&runtime_control)
+                    .map_err(|err| Error::io_path(&runtime_control, err))?
+                    .permissions();
+                permissions.set_mode(0o777);
+                fs::set_permissions(&runtime_control, permissions)
+                    .map_err(|err| Error::io_path(&runtime_control, err))?;
+            }
+
+            let credentials_staging = match (&parent.credentials_staging, opts.drop_credentials) {
+                (Some(src), false) if src.exists() => {
+                    let dst = sandbox_dir.join("credentials-staging");
+                    copy_dir_recursive(src, &dst)?;
+                    Some(dst)
+                }
+                _ => None,
+            };
+
+            let stored = StoredSandbox {
+                id: new_id.clone(),
+                image_path: image.root.clone(),
+                root_disk,
+                cpus: parent.cpus,
+                memory_mib: parent.memory_mib,
+                memory_max_mib: parent.memory_max_mib,
+                memory_min_mib: parent.memory_min_mib,
+                virtiofs_dax_size: parent.virtiofs_dax_size,
+                workspace_mounts,
+                credentials_staging,
+                runtime_config,
+                runtime_control,
+                ephemeral: opts.ephemeral,
+                log_level: parent.log_level,
+                network_proxy: parent.network_proxy.clone(),
+                network_backend: parent.network_backend.clone(),
+            };
+            write_sandbox_metadata(&sandbox_dir.join("sandbox.json"), &stored)?;
+
+            Ok(Sandbox {
+                id: new_id.clone(),
+                state_dir: sandbox_dir.clone(),
+            })
+        })();
+
+        match outcome {
+            Ok(sandbox) => Ok(sandbox),
+            Err(err) => {
+                let _ = fs::remove_dir_all(&sandbox_dir);
+                Err(err)
+            }
+        }
+    }
+
+    /// List the snapshots stored under `<state>/snapshots/`. Snapshots whose
+    /// `manifest.json` is missing or unparseable are silently skipped, the
+    /// same way `list()` skips sandbox directories without metadata.
+    pub fn snapshots(&self) -> Result<Vec<SnapshotSummary>> {
+        let root = self.state_root.join("snapshots");
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut summaries = Vec::new();
+        for entry in fs::read_dir(&root).map_err(|err| Error::io_path(&root, err))? {
+            let entry = entry.map_err(Error::io)?;
+            if !entry.file_type().map_err(Error::io)?.is_dir() {
+                continue;
+            }
+            let id = match entry.file_name().to_str().map(SnapshotId::new) {
+                Some(Ok(id)) => id,
+                _ => continue,
+            };
+            let manifest_path = entry.path().join("manifest.json");
+            let Ok(json) = fs::read_to_string(&manifest_path) else {
+                continue;
+            };
+            let Ok(manifest) = SnapshotManifest::from_json(&json) else {
+                continue;
+            };
+            let root_disk_bytes = fs::metadata(entry.path().join("root.raw"))
+                .ok()
+                .map(|m| m.len());
+            summaries.push(SnapshotSummary {
+                id,
+                parent_sandbox_id: manifest.parent_sandbox_id,
+                kind: manifest.kind,
+                created_unix_millis: manifest.created_unix_millis,
+                state_dir: entry.path(),
+                root_disk_bytes,
+            });
+        }
+        summaries.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        Ok(summaries)
+    }
+
+    /// Read a snapshot's manifest as raw JSON.
+    pub fn inspect_snapshot(&self, id: &SnapshotId) -> Result<String> {
+        let path = self.snapshot_dir(id).join("manifest.json");
+        fs::read_to_string(&path).map_err(|err| Error::io_path(path, err))
+    }
+
+    /// Delete a snapshot directory (and its cloned root disk + bundled
+    /// credentials staging, if any).
+    pub fn delete_snapshot(&self, id: &SnapshotId) -> Result<()> {
+        let dir = self.snapshot_dir(id);
+        if !dir.exists() {
+            return Err(Error::NotFound(format!("snapshot {id}")));
+        }
+        fs::remove_dir_all(&dir).map_err(|err| Error::io_path(&dir, err))
+    }
+
+    /// Resolve the directory a snapshot lives in under the configured state
+    /// root.
+    pub fn snapshot_dir(&self, id: &SnapshotId) -> PathBuf {
+        snapshot_dir_path(&self.state_root, id)
+    }
+
     fn sandbox_dir(&self, id: &SandboxId) -> PathBuf {
         self.state_root.join("sandboxes").join(id.as_str())
     }
@@ -787,6 +1155,63 @@ fn clone_or_copy_root(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     fs::copy(src, dst).map_err(|err| Error::io_path(dst, err))?;
+    Ok(())
+}
+
+/// Recursively copy a directory tree. On macOS uses `cp -cR` so shared blocks
+/// stay APFS copy-on-write (matches `clone_or_copy_root`'s disk path);
+/// elsewhere uses `cp -R` and falls back to a std walk on non-unix hosts.
+///
+/// `dst` must not exist — `cp -R src dst` creates `dst/` mirroring `src/`'s
+/// contents only when `dst` does not yet exist. Snapshot/restore/fork callers
+/// build a fresh parent directory and pass a never-yet-used child path.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        let status = Command::new("cp")
+            .arg("-cR")
+            .arg(src)
+            .arg(dst)
+            .status()
+            .map_err(Error::io)?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    #[cfg(unix)]
+    {
+        let status = Command::new("cp")
+            .arg("-R")
+            .arg(src)
+            .arg(dst)
+            .status()
+            .map_err(Error::io)?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(Error::ProcessFailed {
+            command: format!("cp -R {} {}", src.display(), dst.display()),
+            status,
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        copy_tree_std(src, dst)
+    }
+}
+
+#[cfg(not(unix))]
+fn copy_tree_std(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst).map_err(|err| Error::io_path(dst, err))?;
+    for entry in fs::read_dir(src).map_err(|err| Error::io_path(src, err))? {
+        let entry = entry.map_err(Error::io)?;
+        let entry_src = entry.path();
+        let entry_dst = dst.join(entry.file_name());
+        if entry.file_type().map_err(Error::io)?.is_dir() {
+            copy_tree_std(&entry_src, &entry_dst)?;
+        } else {
+            fs::copy(&entry_src, &entry_dst).map_err(|err| Error::io_path(entry_dst, err))?;
+        }
+    }
     Ok(())
 }
 
@@ -1313,6 +1738,8 @@ fn parse_network_backend(json: &str) -> Result<NetworkBackend> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AgentImageRef;
+    use crate::snapshot::{ForkOptions, RestoreOptions, SnapshotId, SnapshotOptions};
 
     #[test]
     fn workspace_mounts_config_records_declared_guest_paths() {
@@ -1366,5 +1793,401 @@ mod tests {
             env::temp_dir().join(format!("tb-sandbox-runtime-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         root
+    }
+
+    // -- snapshot / restore / fork --------------------------------------------
+
+    const FAKE_DISK: &[u8] = b"root-disk-contents";
+
+    /// Construct a manager pointing at a temp state root plus a minimal fake
+    /// agent image. The image just needs kernel + root.raw + image.json to
+    /// satisfy `AgentImage::load` — no launching happens in these tests.
+    fn snapshot_fixture(label: &str) -> (SandboxManager, PathBuf) {
+        let root = env::temp_dir().join(format!(
+            "tb-sandbox-snapshot-{label}-{}-{}",
+            std::process::id(),
+            unix_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let image = root.join("image");
+        fs::create_dir_all(&image).unwrap();
+        fs::write(image.join("kernel"), b"kernel").unwrap();
+        fs::write(image.join("root.raw"), FAKE_DISK).unwrap();
+        fs::write(
+            image.join("image.json"),
+            format!(
+                r#"{{
+  "architecture": "{}",
+  "kernel": "kernel",
+  "root_disk": "root.raw"
+}}"#,
+                env::consts::ARCH
+            ),
+        )
+        .unwrap();
+        let manager = SandboxManager {
+            state_root: root.join("state"),
+            cache_root: root.join("cache"),
+        };
+        (manager, image)
+    }
+
+    /// Build a sandbox + fake a credentials-staging dir alongside it, so the
+    /// snapshot/fork credentials paths can be exercised without running
+    /// `prepare_credentials` (which reads host secrets).
+    fn create_with_staged_credentials(
+        manager: &SandboxManager,
+        image: &Path,
+        name: &str,
+    ) -> Sandbox {
+        let mut config = SandboxConfig::new(AgentImageRef::new(image));
+        config.name = Some(name.to_string());
+        let sandbox = manager.create(config).unwrap();
+        let staging = sandbox.state_dir.join("credentials-staging");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("token"), b"secret").unwrap();
+        let meta_path = sandbox.state_dir.join("sandbox.json");
+        let meta = fs::read_to_string(&meta_path).unwrap();
+        let new_meta = meta.replace(
+            "\"credentials_staging\": \"\"",
+            &format!("\"credentials_staging\": \"{}\"", staging.display()),
+        );
+        assert_ne!(new_meta, meta, "expected to rewrite credentials_staging");
+        fs::write(&meta_path, new_meta).unwrap();
+        sandbox
+    }
+
+    #[test]
+    fn snapshot_writes_manifest_and_clones_disk() {
+        let (manager, image) = snapshot_fixture("basic");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        let sandbox = manager.create(config).unwrap();
+
+        let snap_id = manager
+            .snapshot(&sandbox.id, SnapshotOptions::default())
+            .unwrap();
+        let snap_dir = manager.snapshot_dir(&snap_id);
+        assert!(snap_dir.join("manifest.json").exists());
+        assert!(snap_dir.join("root.raw").exists());
+        assert_eq!(fs::read(snap_dir.join("root.raw")).unwrap(), FAKE_DISK);
+
+        let manifest_json = manager.inspect_snapshot(&snap_id).unwrap();
+        let manifest = crate::snapshot::SnapshotManifest::from_json(&manifest_json).unwrap();
+        assert_eq!(manifest.parent_sandbox_id, "src");
+        assert_eq!(manifest.image_path, image.canonicalize().unwrap());
+        assert_eq!(manifest.cpus, 1);
+        assert_eq!(manifest.memory_mib, 2048);
+        assert!(!manifest.had_credentials);
+    }
+
+    #[test]
+    fn snapshot_with_explicit_name_uses_it() {
+        let (manager, image) = snapshot_fixture("named");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        let sandbox = manager.create(config).unwrap();
+
+        let snap_id = manager
+            .snapshot(
+                &sandbox.id,
+                SnapshotOptions {
+                    name: Some("my-snap".to_string()),
+                },
+            )
+            .unwrap();
+        assert_eq!(snap_id.as_str(), "my-snap");
+        assert!(manager.snapshot_dir(&snap_id).exists());
+    }
+
+    #[test]
+    fn snapshot_id_collision_fails_without_clobbering() {
+        let (manager, image) = snapshot_fixture("collision");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        let sandbox = manager.create(config).unwrap();
+
+        let opts = SnapshotOptions {
+            name: Some("dup".to_string()),
+        };
+        manager.snapshot(&sandbox.id, opts.clone()).unwrap();
+        let err = manager.snapshot(&sandbox.id, opts).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        // The pre-existing snapshot is intact.
+        let snap_id = SnapshotId::new("dup").unwrap();
+        assert!(manager
+            .snapshot_dir(&snap_id)
+            .join("manifest.json")
+            .exists());
+    }
+
+    #[test]
+    fn snapshot_bundles_credentials_when_present() {
+        let (manager, image) = snapshot_fixture("bundles-creds");
+        let sandbox = create_with_staged_credentials(&manager, &image, "src");
+
+        let snap_id = manager
+            .snapshot(&sandbox.id, SnapshotOptions::default())
+            .unwrap();
+        let snap_dir = manager.snapshot_dir(&snap_id);
+        assert!(snap_dir.join("credentials-staging").exists());
+        let token = fs::read(snap_dir.join("credentials-staging/token")).unwrap();
+        assert_eq!(token, b"secret");
+        let manifest_json = manager.inspect_snapshot(&snap_id).unwrap();
+        assert!(manifest_json.contains("\"had_credentials\": true"));
+    }
+
+    #[test]
+    fn snapshot_fails_for_missing_sandbox() {
+        let (manager, _image) = snapshot_fixture("missing");
+        let bogus = SandboxId::new("nothing-here").unwrap();
+        let err = manager
+            .snapshot(&bogus, SnapshotOptions::default())
+            .unwrap_err();
+        // load() opens sandbox.json which doesn't exist; expect an IO error.
+        assert!(matches!(err, Error::Io { .. }));
+    }
+
+    #[test]
+    fn restore_creates_new_sandbox_from_snapshot() {
+        let (manager, image) = snapshot_fixture("restore-basic");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        let sandbox = manager.create(config).unwrap();
+        let snap_id = manager
+            .snapshot(&sandbox.id, SnapshotOptions::default())
+            .unwrap();
+
+        let opts = RestoreOptions {
+            name: Some("restored".to_string()),
+            ..Default::default()
+        };
+        let new = manager.restore(&snap_id, opts).unwrap();
+        assert_eq!(new.id.as_str(), "restored");
+        assert!(new.state_dir.join("sandbox.json").exists());
+        assert!(new.state_dir.join("root.raw").exists());
+        assert_eq!(fs::read(new.state_dir.join("root.raw")).unwrap(), FAKE_DISK);
+
+        // APFS CoW (or plain copy fallback) means writes to the restored disk
+        // do not leak back into the snapshot.
+        fs::write(new.state_dir.join("root.raw"), b"diverged").unwrap();
+        let snap_root = fs::read(manager.snapshot_dir(&snap_id).join("root.raw")).unwrap();
+        assert_eq!(snap_root, FAKE_DISK);
+    }
+
+    #[test]
+    fn restore_default_name_is_unique() {
+        let (manager, image) = snapshot_fixture("restore-default-name");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        let sandbox = manager.create(config).unwrap();
+        let snap_id = manager
+            .snapshot(&sandbox.id, SnapshotOptions::default())
+            .unwrap();
+        let restored = manager
+            .restore(&snap_id, RestoreOptions::default())
+            .unwrap();
+        assert!(restored.id.as_str().starts_with("restore-"));
+    }
+
+    #[test]
+    fn restore_with_overrides_applies_them() {
+        let (manager, image) = snapshot_fixture("restore-overrides");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        config.cpus = 1;
+        config.memory_mib = 1024;
+        let sandbox = manager.create(config).unwrap();
+        let snap_id = manager
+            .snapshot(&sandbox.id, SnapshotOptions::default())
+            .unwrap();
+
+        let opts = RestoreOptions {
+            name: Some("custom".to_string()),
+            cpus: Some(4),
+            memory_mib: Some(4096),
+            memory_max_mib: Some(8192),
+            workspace_mounts: Some(Vec::new()),
+            ..Default::default()
+        };
+        let new = manager.restore(&snap_id, opts).unwrap();
+        let json = manager.inspect(&new.id).unwrap();
+        assert!(json.contains("\"cpus\": 4"));
+        assert!(json.contains("\"memory_mib\": 4096"));
+        assert!(json.contains("\"memory_max_mib\": 8192"));
+    }
+
+    #[test]
+    fn restore_inherits_credentials_unless_dropped() {
+        let (manager, image) = snapshot_fixture("restore-creds");
+        let sandbox = create_with_staged_credentials(&manager, &image, "src");
+        let snap_id = manager
+            .snapshot(&sandbox.id, SnapshotOptions::default())
+            .unwrap();
+
+        let new = manager
+            .restore(
+                &snap_id,
+                RestoreOptions {
+                    name: Some("with-creds".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(new.state_dir.join("credentials-staging/token").exists());
+
+        let dropped = manager
+            .restore(
+                &snap_id,
+                RestoreOptions {
+                    name: Some("no-creds".to_string()),
+                    drop_credentials: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!dropped.state_dir.join("credentials-staging").exists());
+    }
+
+    #[test]
+    fn restore_fails_for_missing_snapshot() {
+        let (manager, _image) = snapshot_fixture("restore-missing");
+        let bogus = SnapshotId::new("no-such-snap").unwrap();
+        let err = manager
+            .restore(&bogus, RestoreOptions::default())
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[test]
+    fn fork_inherits_parent_config_and_diverges_on_write() {
+        let (manager, image) = snapshot_fixture("fork-basic");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("parent".to_string());
+        config.cpus = 2;
+        config.memory_mib = 4096;
+        let parent = manager.create(config).unwrap();
+
+        let child = manager
+            .fork(
+                &parent.id,
+                ForkOptions {
+                    name: Some("child".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let json = manager.inspect(&child.id).unwrap();
+        assert!(json.contains("\"cpus\": 2"));
+        assert!(json.contains("\"memory_mib\": 4096"));
+        assert_eq!(
+            fs::read(child.state_dir.join("root.raw")).unwrap(),
+            FAKE_DISK
+        );
+
+        // Diverge: write to the child disk, parent is unaffected.
+        fs::write(child.state_dir.join("root.raw"), b"child-write").unwrap();
+        assert_eq!(
+            fs::read(parent.state_dir.join("root.raw")).unwrap(),
+            FAKE_DISK
+        );
+    }
+
+    #[test]
+    fn fork_default_name_derives_from_parent() {
+        let (manager, image) = snapshot_fixture("fork-name");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("origin".to_string());
+        let parent = manager.create(config).unwrap();
+        let child = manager.fork(&parent.id, ForkOptions::default()).unwrap();
+        assert!(child.id.as_str().starts_with("origin-fork-"));
+    }
+
+    #[test]
+    fn fork_inherits_credentials_unless_dropped() {
+        let (manager, image) = snapshot_fixture("fork-creds");
+        let parent = create_with_staged_credentials(&manager, &image, "parent");
+
+        let inherited = manager
+            .fork(
+                &parent.id,
+                ForkOptions {
+                    name: Some("inheritor".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(inherited
+            .state_dir
+            .join("credentials-staging/token")
+            .exists());
+
+        let dropped = manager
+            .fork(
+                &parent.id,
+                ForkOptions {
+                    name: Some("dropper".to_string()),
+                    drop_credentials: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!dropped.state_dir.join("credentials-staging").exists());
+    }
+
+    #[test]
+    fn snapshots_list_skips_malformed_directories() {
+        let (manager, image) = snapshot_fixture("snapshots-list");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        let sandbox = manager.create(config).unwrap();
+        manager
+            .snapshot(
+                &sandbox.id,
+                SnapshotOptions {
+                    name: Some("a".to_string()),
+                },
+            )
+            .unwrap();
+        manager
+            .snapshot(
+                &sandbox.id,
+                SnapshotOptions {
+                    name: Some("b".to_string()),
+                },
+            )
+            .unwrap();
+        // Junk directory: no manifest -> skipped on list.
+        let junk = manager.state_root.join("snapshots/garbage");
+        fs::create_dir_all(&junk).unwrap();
+
+        let summaries = manager.snapshots().unwrap();
+        let ids: Vec<_> = summaries
+            .iter()
+            .map(|s| s.id.as_str().to_string())
+            .collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        for s in &summaries {
+            assert_eq!(s.root_disk_bytes, Some(FAKE_DISK.len() as u64));
+            assert_eq!(s.parent_sandbox_id, "src");
+        }
+    }
+
+    #[test]
+    fn delete_snapshot_removes_directory() {
+        let (manager, image) = snapshot_fixture("snapshot-delete");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        let sandbox = manager.create(config).unwrap();
+        let snap_id = manager
+            .snapshot(&sandbox.id, SnapshotOptions::default())
+            .unwrap();
+        let dir = manager.snapshot_dir(&snap_id);
+        assert!(dir.exists());
+        manager.delete_snapshot(&snap_id).unwrap();
+        assert!(!dir.exists());
+        let err = manager.delete_snapshot(&snap_id).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
     }
 }

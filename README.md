@@ -462,6 +462,63 @@ my-sandbox	running	2048MiB	/path/to/state/sandboxes/my-sandbox	/path/to/image
 other   	stopped	-      	/path/to/state/sandboxes/other      	/path/to/image
 ```
 
+## Snapshot, Restore, And Fork
+
+A sandbox's root disk can be captured into an immutable artifact and used to
+provision new sandboxes. This is **disk-only**: guest memory, vCPU state, and
+live processes are not preserved — restored and forked sandboxes cold-boot
+from the snapshotted disk. The memory/process side is tracked as Phase 3 of
+[docs/closing-the-smolvm-gap-plan.md](docs/closing-the-smolvm-gap-plan.md)
+and depends on libkrun HVF capture work.
+
+**Snapshot** captures the disk + sandbox configuration:
+
+```sh
+cargo run -- snapshot my-sandbox
+cargo run -- snapshot my-sandbox --name pre-build
+cargo run -- snapshots                    # list
+cargo run -- snapshot-inspect pre-build   # print manifest as JSON
+cargo run -- snapshot-delete pre-build
+```
+
+The disk clone uses APFS copy-on-write on macOS so snapshot creation is ~5 ms
+and the snapshot shares blocks with the source sandbox until either side
+writes. Snapshotting a running sandbox produces a crash-consistent image —
+the guest filesystem journal replays on next boot. Snapshot a stopped sandbox
+when correctness across the boundary matters.
+
+**Restore** creates a fresh sandbox whose root disk starts from a snapshot:
+
+```sh
+cargo run -- restore pre-build --name fresh
+cargo run -- restore pre-build --name big --cpus 4 --memory-mib 4096 --memory-max-mib 8192
+cargo run -- restore pre-build --workspace . --no-credentials
+cargo run -- restore pre-build --ephemeral
+```
+
+Unset options inherit from the snapshot manifest (cpus, memory, virtio-fs DAX
+size, workspace mounts, network backend, proxy config). `--no-credentials`
+skips inheriting the snapshot's bundled credentials-staging; without it,
+restore copies the snapshot's credentials into the new sandbox.
+
+**Fork** is snapshot + immediate restore in one step, with no persisted
+intermediate snapshot. The fork inherits the parent's configuration
+wholesale:
+
+```sh
+cargo run -- fork my-sandbox                       # auto-name: my-sandbox-fork-<ts>
+cargo run -- fork my-sandbox --name sibling
+cargo run -- fork my-sandbox --name sibling --workspace . --no-credentials
+```
+
+Use fork to **branch** a configured sandbox into siblings — same image, same
+mounts, same credentials, same hardware shape — without writing a checkpoint
+to disk. Use snapshot + restore when you want a reusable starting point.
+
+After a fork or restore, write to the new sandbox's `root.raw` does not leak
+back to the parent or snapshot. Subsequent `start` / `shell` on the new
+sandbox follows the same boot path as a freshly created one.
+
 ## Run Many Sandboxes (Density)
 
 Two host-side controls keep many concurrent sandboxes within a machine's

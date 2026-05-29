@@ -5,6 +5,7 @@ use crate::config::{
 use crate::error::{Error, Result};
 use crate::runtime::{SandboxId, SandboxManager};
 use crate::sdk::{GuestCommand, SandboxManagerSdk, SandboxRuntimeSdk};
+use crate::snapshot::{ForkOptions, RestoreOptions, SnapshotId, SnapshotOptions};
 use std::env;
 use std::path::PathBuf;
 
@@ -43,7 +44,11 @@ pub fn run(args: Vec<String>) -> Result<()> {
         }
         "list" => {
             for summary in manager.list()? {
-                let state = if summary.running { "running" } else { "stopped" };
+                let state = if summary.running {
+                    "running"
+                } else {
+                    "stopped"
+                };
                 let reserved = summary
                     .reserved_mib
                     .map(|mib| format!("{mib}MiB"))
@@ -100,12 +105,178 @@ pub fn run(args: Vec<String>) -> Result<()> {
             println!("deleted {id}");
             Ok(())
         }
+        "snapshot" => {
+            let id = required_id(args.next(), "snapshot")?;
+            let opts = parse_snapshot_options(args.collect())?;
+            let snap_id = manager.snapshot(&id, opts)?;
+            println!("{snap_id}");
+            println!("{}", manager.snapshot_dir(&snap_id).display());
+            Ok(())
+        }
+        "snapshots" => {
+            for summary in manager.snapshots()? {
+                let bytes = summary
+                    .root_disk_bytes
+                    .map(|b| format!("{b}B"))
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    summary.id,
+                    summary.kind.as_str(),
+                    summary.parent_sandbox_id,
+                    summary.created_unix_millis,
+                    bytes,
+                    summary.state_dir.display(),
+                );
+            }
+            Ok(())
+        }
+        "snapshot-inspect" => {
+            let id = required_snapshot_id(args.next(), "snapshot-inspect")?;
+            print!("{}", manager.inspect_snapshot(&id)?);
+            Ok(())
+        }
+        "snapshot-delete" => {
+            let id = required_snapshot_id(args.next(), "snapshot-delete")?;
+            manager.delete_snapshot(&id)?;
+            println!("deleted {id}");
+            Ok(())
+        }
+        "restore" => {
+            let id = required_snapshot_id(args.next(), "restore")?;
+            let opts = parse_restore_options(args.collect())?;
+            let sandbox = manager.restore(&id, opts)?;
+            println!("restored {}", sandbox.id);
+            println!("{}", sandbox.state_dir.display());
+            Ok(())
+        }
+        "fork" => {
+            let id = required_id(args.next(), "fork")?;
+            let opts = parse_fork_options(args.collect())?;
+            let sandbox = manager.fork(&id, opts)?;
+            println!("forked {}", sandbox.id);
+            println!("{}", sandbox.state_dir.display());
+            Ok(())
+        }
         "help" | "--help" | "-h" => {
             print_help(&program);
             Ok(())
         }
         other => Err(Error::InvalidArgument(format!("unknown command {other}"))),
     }
+}
+
+fn required_snapshot_id(value: Option<String>, command: &str) -> Result<SnapshotId> {
+    let value = value.ok_or_else(|| {
+        Error::InvalidArgument(format!("tb-sandbox {command} requires SNAPSHOT_ID"))
+    })?;
+    SnapshotId::new(value)
+}
+
+fn parse_snapshot_options(args: Vec<String>) -> Result<SnapshotOptions> {
+    let mut opts = SnapshotOptions::default();
+    let mut iter = args.into_iter().peekable();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--name" => opts.name = Some(next_value(&mut iter, "--name")?),
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "unexpected argument to snapshot: {other}"
+                )));
+            }
+        }
+    }
+    Ok(opts)
+}
+
+fn parse_restore_options(args: Vec<String>) -> Result<RestoreOptions> {
+    let mut opts = RestoreOptions::default();
+    let mut workspace_override: Option<Vec<WorkspaceMount>> = None;
+    let mut iter = args.into_iter().peekable();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--name" => opts.name = Some(next_value(&mut iter, "--name")?),
+            "--workspace" => {
+                let path = PathBuf::from(next_value(&mut iter, "--workspace")?);
+                workspace_override = Some(vec![WorkspaceMount::workspace(canonicalize_existing(
+                    &path,
+                )?)]);
+            }
+            "--no-workspace" => {
+                workspace_override = Some(Vec::new());
+            }
+            "--no-credentials" => opts.drop_credentials = true,
+            "--cpus" => {
+                opts.cpus = Some(next_value(&mut iter, "--cpus")?.parse().map_err(|_| {
+                    Error::InvalidArgument("--cpus must be an integer".to_string())
+                })?);
+            }
+            "--memory-mib" => {
+                opts.memory_mib = Some(next_value(&mut iter, "--memory-mib")?.parse().map_err(
+                    |_| Error::InvalidArgument("--memory-mib must be an integer".to_string()),
+                )?);
+            }
+            "--memory-max-mib" => {
+                opts.memory_max_mib = Some(
+                    next_value(&mut iter, "--memory-max-mib")?
+                        .parse()
+                        .map_err(|_| {
+                            Error::InvalidArgument(
+                                "--memory-max-mib must be an integer".to_string(),
+                            )
+                        })?,
+                );
+            }
+            "--memory-min-mib" => {
+                opts.memory_min_mib = Some(
+                    next_value(&mut iter, "--memory-min-mib")?
+                        .parse()
+                        .map_err(|_| {
+                            Error::InvalidArgument(
+                                "--memory-min-mib must be an integer".to_string(),
+                            )
+                        })?,
+                );
+            }
+            "--ephemeral" => opts.ephemeral = true,
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "unexpected argument to restore: {other}"
+                )));
+            }
+        }
+    }
+    opts.workspace_mounts = workspace_override;
+    Ok(opts)
+}
+
+fn parse_fork_options(args: Vec<String>) -> Result<ForkOptions> {
+    let mut opts = ForkOptions::default();
+    let mut workspace_override: Option<Vec<WorkspaceMount>> = None;
+    let mut iter = args.into_iter().peekable();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--name" => opts.name = Some(next_value(&mut iter, "--name")?),
+            "--workspace" => {
+                let path = PathBuf::from(next_value(&mut iter, "--workspace")?);
+                workspace_override = Some(vec![WorkspaceMount::workspace(canonicalize_existing(
+                    &path,
+                )?)]);
+            }
+            "--no-workspace" => {
+                workspace_override = Some(Vec::new());
+            }
+            "--no-credentials" => opts.drop_credentials = true,
+            "--ephemeral" => opts.ephemeral = true,
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "unexpected argument to fork: {other}"
+                )));
+            }
+        }
+    }
+    opts.workspace_mounts = workspace_override;
+    Ok(opts)
 }
 
 /// Build a single-threaded tokio runtime and run an async SDK operation to
@@ -508,7 +679,9 @@ fn parse_size_bytes(value: &str) -> Result<u64> {
         _ => (trimmed, 1),
     };
     let base: u64 = number.trim().parse().map_err(|_| {
-        Error::InvalidArgument(format!("invalid byte size {value}; use bytes or a K/M/G suffix"))
+        Error::InvalidArgument(format!(
+            "invalid byte size {value}; use bytes or a K/M/G suffix"
+        ))
     })?;
     base.checked_mul(multiplier)
         .ok_or_else(|| Error::InvalidArgument(format!("byte size {value} overflows")))
@@ -594,6 +767,14 @@ Usage:
   {program} inspect SANDBOX_ID
   {program} resize SANDBOX_ID --memory-mib N
   {program} delete SANDBOX_ID
+  {program} snapshot SANDBOX_ID [--name NAME]
+  {program} snapshots
+  {program} snapshot-inspect SNAPSHOT_ID
+  {program} snapshot-delete SNAPSHOT_ID
+  {program} restore SNAPSHOT_ID [--name NEW_ID] [--workspace PATH] [--no-credentials]
+                              [--cpus N] [--memory-mib N] [--memory-max-mib N]
+                              [--memory-min-mib N] [--ephemeral]
+  {program} fork SANDBOX_ID [--name NEW_ID] [--workspace PATH] [--no-credentials] [--ephemeral]
 
 Common options:
   --image PATH_OR_REF
