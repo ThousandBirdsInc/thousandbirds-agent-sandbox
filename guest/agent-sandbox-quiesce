@@ -1,0 +1,162 @@
+#!/bin/sh
+# agent-sandbox-quiesce: cooperative quiesce daemon for snapshots.
+#
+# Polls the runtime-control mount for `quiesce.req`, calls `sync` to flush
+# the rootfs, writes `quiesce.ack`, waits for `resume.req` (bounded by the
+# request's `deadline_unix_millis`), and writes `resume.ack`.
+#
+# Protocol: see src/quiesce.rs for the wrapper-side counterpart and the
+# canonical text key=value format. Files live in the runtime-control
+# virtio-fs mount at /run/agent-sandbox/control/ (host side:
+# <sandbox_dir>/runtime-control/, mode 0777).
+#
+# This build implements **sync-only** quiescence. A `freeze` action request
+# is downgraded to sync because driving `fsfreeze -f /` from a daemon hosted
+# on the frozen rootfs would deadlock the daemon's own polling loop the
+# moment it tried to exec /bin/sleep (rootfs is frozen, exec faults block).
+# Doing freeze safely requires either caching /bin/sleep + /sbin/fsfreeze in
+# tmpfs and a bash-builtin polling strategy, or kernel-level changes. The
+# wrapper records the actual action performed in the manifest so manifests
+# never lie about what really ran.
+
+set -u
+
+CONTROL_DIR="${AGENT_SANDBOX_CONTROL_DIR:-/run/agent-sandbox/control}"
+POLL_SEC="${AGENT_SANDBOX_QUIESCE_POLL_SEC:-0.1}"
+
+log() {
+  printf 'agent-sandbox-quiesce: %s\n' "$*" >&2
+}
+
+now_ms() {
+  # Second precision is enough; the wrapper's safety window is in minutes.
+  # Multiply to keep the unit consistent with what the wrapper writes.
+  s=$(date +%s 2>/dev/null || echo 0)
+  printf '%s000\n' "$s"
+}
+
+read_field() {
+  # read_field KEY FILE -> prints value, returns 0 found / 1 missing
+  key="$1"
+  file="$2"
+  [ -f "$file" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      "${key}="*)
+        printf '%s' "${line#${key}=}"
+        return 0
+        ;;
+    esac
+  done < "$file"
+  return 1
+}
+
+write_response() {
+  # Atomic write so a wrapper reading concurrently never sees half a file.
+  final="$1"
+  content="$2"
+  tmp="${final}.tmp.$$"
+  printf '%s' "$content" > "$tmp" 2>/dev/null || return 1
+  mv -f "$tmp" "$final" 2>/dev/null
+}
+
+handle_quiesce() {
+  req="$CONTROL_DIR/quiesce.req"
+  id=$(read_field id "$req") || return 0
+  [ -n "$id" ] || return 0
+  action=$(read_field action "$req" 2>/dev/null) || action=""
+  deadline=$(read_field deadline_unix_millis "$req" 2>/dev/null) || deadline=""
+  [ -n "$action" ] || action="sync"
+  [ -n "$deadline" ] || deadline="0"
+
+  sync 2>/dev/null
+
+  performed="sync"
+  message=""
+  if [ "$action" = "freeze" ]; then
+    message="freeze requested; downgraded to sync (guest-side freeze not implemented in this build)"
+  fi
+
+  achieved=$(now_ms)
+  ack="id=${id}
+status=ok
+action=${performed}
+achieved_unix_millis=${achieved}
+"
+  if [ -n "$message" ]; then
+    ack="${ack}message=${message}
+"
+  fi
+  if ! write_response "$CONTROL_DIR/quiesce.ack" "$ack"; then
+    log "failed to write quiesce.ack for id=${id}"
+    return 0
+  fi
+
+  # Wait for resume.req or deadline. The wrapper writes a deadline several
+  # minutes out as a safety net; if the wrapper crashes between freeze and
+  # release, the deadline triggers an auto-resume so we never wedge.
+  if [ "$deadline" -gt 0 ] 2>/dev/null; then
+    effective_deadline="$deadline"
+  else
+    effective_deadline=$((achieved + 5 * 60 * 1000))
+  fi
+
+  resume_id=""
+  auto_resumed=0
+  while true; do
+    if [ -f "$CONTROL_DIR/resume.req" ]; then
+      resume_id=$(read_field id "$CONTROL_DIR/resume.req" 2>/dev/null) || resume_id=""
+      break
+    fi
+    now=$(now_ms)
+    if [ "$now" -ge "$effective_deadline" ] 2>/dev/null; then
+      auto_resumed=1
+      break
+    fi
+    sleep "$POLL_SEC" 2>/dev/null || sleep 1
+  done
+
+  if [ "$auto_resumed" -eq 1 ]; then
+    log "auto-resumed after deadline (no resume.req for id=${id})"
+  fi
+
+  # Defense-in-depth: flush again so anything the wrapper wrote during the
+  # quiesce window through a different channel is durable.
+  sync 2>/dev/null
+
+  # Always write resume.ack when we saw a real resume.req so the wrapper's
+  # release() returns cleanly. On auto-resume the wrapper has likely moved
+  # on already; nothing to ack to.
+  if [ -n "$resume_id" ]; then
+    resumed=$(now_ms)
+    if ! write_response "$CONTROL_DIR/resume.ack" "id=${resume_id}
+status=ok
+resumed_unix_millis=${resumed}
+"; then
+      log "failed to write resume.ack for id=${resume_id}"
+    fi
+  fi
+
+  # Sweep our request files so a daemon restart does not re-handle a stale
+  # cycle. The wrapper's next cycle does its own sweep too.
+  rm -f "$CONTROL_DIR/quiesce.req" "$CONTROL_DIR/resume.req"
+}
+
+# Wait for the control mount. agent-sandbox-shell mounts it lazily, so on
+# early boot the daemon may race the mount; bound the wait at ~60s.
+i=0
+while [ ! -d "$CONTROL_DIR" ] && [ "$i" -lt 600 ]; do
+  sleep 0.1
+  i=$((i + 1))
+done
+if [ ! -d "$CONTROL_DIR" ]; then
+  log "control dir $CONTROL_DIR never appeared; exiting"
+  exit 1
+fi
+
+while true; do
+  if [ -f "$CONTROL_DIR/quiesce.req" ]; then
+    handle_quiesce
+  fi
+  sleep "$POLL_SEC" 2>/dev/null || sleep 1
+done

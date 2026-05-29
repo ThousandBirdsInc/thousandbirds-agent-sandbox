@@ -483,9 +483,27 @@ cargo run -- snapshot-delete pre-build
 
 The disk clone uses APFS copy-on-write on macOS so snapshot creation is ~5 ms
 and the snapshot shares blocks with the source sandbox until either side
-writes. Snapshotting a running sandbox produces a crash-consistent image —
-the guest filesystem journal replays on next boot. Snapshot a stopped sandbox
-when correctness across the boundary matters.
+writes.
+
+**Snapshots of running sandboxes are cooperatively quiesced.** Before the
+clone, the wrapper asks the in-guest `agent-sandbox-quiesce` daemon to flush
+the rootfs (`sync`), waits for the ack on the runtime-control mount, then
+clones the disk, then sends a resume. This produces a strictly better
+artifact than crash-consistent: in-flight writes are flushed before the
+clone snapshots them. The manifest records `"quiesced": true` and the
+`"quiesce_action"` performed (`sync` in this build; the protocol also
+supports `freeze` and will use it when the guest-side daemon learns to drive
+`fsfreeze -f /` safely without deadlocking its own polling loop).
+
+Snapshots of stopped sandboxes skip quiesce automatically (nothing to
+flush). On a running sandbox:
+
+- `--no-quiesce` skips it (crash-consistent fallback, useful if the in-guest
+  daemon is missing or hung).
+- `--no-freeze` asks for sync only — the default action requested is
+  `freeze`, which the current daemon downgrades to `sync` (the manifest
+  records the downgrade).
+- `--quiesce-timeout SECS` tunes the per-side timeout (default 10 s).
 
 **Restore** creates a fresh sandbox whose root disk starts from a snapshot:
 

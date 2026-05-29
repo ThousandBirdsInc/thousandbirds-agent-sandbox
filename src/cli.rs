@@ -179,6 +179,18 @@ fn parse_snapshot_options(args: Vec<String>) -> Result<SnapshotOptions> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--name" => opts.name = Some(next_value(&mut iter, "--name")?),
+            "--no-quiesce" => opts.skip_quiesce = true,
+            "--no-freeze" => opts.quiesce_freeze = false,
+            "--quiesce-timeout" => {
+                let secs: u64 = next_value(&mut iter, "--quiesce-timeout")?
+                    .parse()
+                    .map_err(|_| {
+                        Error::InvalidArgument(
+                            "--quiesce-timeout must be an integer number of seconds".to_string(),
+                        )
+                    })?;
+                opts.quiesce_timeout = Some(std::time::Duration::from_secs(secs));
+            }
             other => {
                 return Err(Error::InvalidArgument(format!(
                     "unexpected argument to snapshot: {other}"
@@ -767,7 +779,7 @@ Usage:
   {program} inspect SANDBOX_ID
   {program} resize SANDBOX_ID --memory-mib N
   {program} delete SANDBOX_ID
-  {program} snapshot SANDBOX_ID [--name NAME]
+  {program} snapshot SANDBOX_ID [--name NAME] [--no-quiesce] [--no-freeze] [--quiesce-timeout SECS]
   {program} snapshots
   {program} snapshot-inspect SNAPSHOT_ID
   {program} snapshot-delete SNAPSHOT_ID

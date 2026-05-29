@@ -264,29 +264,70 @@ verified by `cargo test` (`runtime::tests::snapshot_*`,
 `runtime::tests::snapshots_*`, `runtime::tests::delete_snapshot_*`,
 `snapshot::tests::*`).
 
-#### Phase 2 — Cooperative guest quiescence [repo, krun-light]
+#### Phase 2 — Cooperative guest quiescence [repo, krun-light] — IMPLEMENTED (sync; freeze deferred)
 
 Goal: a deterministic "this guest is safe to snapshot" point. Even though
 memory capture comes in Phase 3, getting quiescence right is independent and
 unblocks both #3 and any later live-snapshot work.
 
-Concrete changes:
+Landed:
 
-- New `guest/agent-sandbox-quiesce` script + `agent-sandbox-quiesce.service`
-  that, on signal over the control socket: refuses new shell sessions,
-  flushes block devices (`sync`, `fsfreeze -f /` if supported), drains
-  in-flight virtio requests, and emits a `KRUN_OSMODE: quiesced` marker.
-- Extend the in-VM control listener (the existing balloon control path,
-  per `src/runtime.rs:587`) with a `quiesce` / `resume` RPC.
-- Wrapper-side `SandboxManager::snapshot` blocks on the `quiesced` marker
-  (timeout configurable, default 10 s) before writing the artifact, then
-  issues `resume` on success and on every error path.
-- Manifest records the quiescence timestamp and the marker line for forensics.
+- New `src/quiesce.rs`: `QuiesceClient`, `QuiesceTicket` (RAII drop fires
+  best-effort `resume.req` if the explicit release path is skipped),
+  `QuiesceAction { Sync, Freeze }`, atomic text-file protocol on the
+  runtime-control virtio-fs mount (key=value `quiesce.req` / `quiesce.ack` /
+  `resume.req` / `resume.ack`), host-side `flock` on `quiesce.lock` to
+  serialize concurrent snapshot cycles on the same sandbox.
+- Per-request `deadline_unix_millis` written into `quiesce.req` so the guest
+  auto-resumes if the wrapper dies mid-snapshot (independent safety net
+  alongside RAII drop). Default safety window is 5 minutes.
+- `SandboxManager::snapshot` in `src/runtime.rs` now quiesces before the
+  disk clone and releases after, when the sandbox is running and the caller
+  did not opt out (`SnapshotOptions::skip_quiesce`). Stopped sandboxes skip
+  quiesce automatically.
+- `SnapshotManifest` gained `quiesced`, `quiesce_action`,
+  `quiesced_unix_millis` — forensic record of what actually ran (not just
+  what was requested, so a downgrade is visible).
+- CLI flags on `snapshot`: `--no-quiesce`, `--no-freeze`,
+  `--quiesce-timeout SECS`.
+- New `guest/agent-sandbox-quiesce` (POSIX sh) + matching systemd unit.
+  Daemon polls the control mount, runs `sync`, writes the ack, waits for
+  `resume.req` (bounded by deadline), writes `resume.ack`. Installed by
+  `scripts/build-agent-image.sh` next to the existing shell service.
+- 10 new tests (5 in `quiesce::tests` for the protocol mechanics, 5 in
+  `runtime::tests` for the integration): round-trip with fake guest,
+  timeout, error-status surfacing, RAII drop sends resume, parser
+  robustness, control-dir missing fail-fast, plus the snapshot-of-running
+  integration tests — quiesced/sync action/skip/stopped/unresponsive.
 
-**Exit criteria:** a long-running build in the guest can be quiesced and
-resumed with no I/O loss, verified by checksumming a file the guest is
-actively writing across the quiesce window. Failure of the guest to quiesce
-within the timeout is a clean error, not a hang.
+**Action-downgrade caveat — documented, not a bug.** This build's daemon
+implements `sync` only. A `freeze` action request is downgraded to sync and
+the manifest's `quiesce_action` records `"sync"` truthfully. The reason:
+driving `fsfreeze -f /` from a shell daemon hosted on the frozen rootfs
+would deadlock the daemon's own polling loop the moment it tried to exec
+`/bin/sleep` — the rootfs is frozen, the exec faults. Doing freeze safely
+needs either cached binaries in tmpfs plus a bash-builtin polling strategy
+(read-with-timeout on a fifo on fd 9), or kernel-level changes. Both are
+straightforward follow-ons; neither is on the critical path because
+sync-only already moves snapshot-of-running from "crash-consistent" to
+"flushed + clone".
+
+**On-VM verification:** still a manual step — needs a real Linux guest
+booted via the libkrun os_mode launcher with an image rebuilt to include
+the new daemon. The protocol is fully exercised by the Rust tests against
+a fake guest, and the daemon is POSIX-sh syntax-checked.
+
+**Exit criteria — met for sync-mode:** Wrapper-side `SandboxManager::snapshot`
+quiesces running sandboxes (sync + flush) before the disk clone, surfaces
+guest-side errors and timeouts cleanly, never leaves a half-written snapshot
+or a wedged guest. Failure modes are covered by tests:
+`snapshot_of_running_sandbox_quiesces_before_clone`,
+`snapshot_records_sync_action_when_freeze_disabled`,
+`snapshot_skip_quiesce_does_not_touch_runtime_control`,
+`snapshot_of_stopped_sandbox_skips_quiesce_silently`,
+`snapshot_of_running_sandbox_fails_when_guest_unresponsive`. Strict-freeze
+mode (and its on-VM checksum-while-writing test from the original exit
+criteria) remains the small follow-on.
 
 #### Phase 3 — HVF memory + vCPU + device capture [krun-heavy]
 
@@ -523,19 +564,21 @@ Original plan, calendar order if one engineer works end-to-end:
 
 1. **G4 packaging** — 1–2 weeks. Unblocks all external evaluation.
 2. **G1 Phase 1 (artifact + cold-boot-replay restore + fork)** — 1–2 weeks. **DONE.**
-3. **G1 Phase 2 (quiescence)** — 1 week.
+3. **G1 Phase 2 (quiescence)** — 1 week. **DONE (sync-mode; freeze deferred).**
 4. **G3 browser image + VNC viewer** — 2–3 weeks. Independent of G1
    Phases 3/4, can interleave.
 5. **G1 Phase 3 (HVF capture/restore)** — 6–10 weeks. The hard one. Owns
    most of the calendar.
 6. **G1 Phase 4 (dedup)** — deferred.
 
-Remaining critical path is **Phase 2 (cooperative quiesce)** → **Phase 3
-(HVF memory/vCPU/device capture)**. Phase 2 is a small in-VM control-listener
-extension; Phase 3 is the multi-month libkrun-side work and is unchanged.
-G4 (packaging) and G3 (browser image) remain parallelizable with G1.
+Remaining critical path is **Phase 3 (HVF memory/vCPU/device capture)** —
+the multi-month libkrun-side work, unchanged in scope. Two small follow-ons
+sit on the side: strict-freeze in the quiesce daemon (cached binaries +
+bash-builtin polling), and on-VM verification of the quiesce round-trip
+against a real Linux guest. G4 (packaging) and G3 (browser image) remain
+parallelizable with G1 Phase 3.
 
-If two engineers work in parallel, G4 + G3 go to engineer A and G1 Phase 2/3
+If two engineers work in parallel, G4 + G3 go to engineer A and G1 Phase 3
 to engineer B; merge after G1 Phase 3.
 
 ## Open Questions

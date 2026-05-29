@@ -7,6 +7,7 @@ use crate::error::{Error, Result};
 use crate::image::{json_bool, json_number, json_string, json_string_array, AgentImage};
 use crate::libkrun::{launch_command, LaunchConfig};
 use crate::proxy::NetworkProxy;
+use crate::quiesce::{QuiesceAction, QuiesceClient};
 use crate::scheduler::ResourceLedger;
 use crate::snapshot::{
     config_from_manifest, snapshot_dir as snapshot_dir_path, ForkOptions, RestoreOptions,
@@ -643,9 +644,13 @@ impl SandboxManager {
     /// **disk-only**: guest memory, vCPU state, and live processes are not
     /// preserved — `restore` cold-boots from the snapshotted disk.
     ///
-    /// Snapshotting a running sandbox produces a crash-consistent disk image
-    /// (filesystem journal replays on next boot). For correctness across the
-    /// boundary, snapshot a stopped sandbox.
+    /// When the sandbox is running and `opts.skip_quiesce` is false, the
+    /// in-guest `agent-sandbox-quiesce` daemon is asked to flush (and
+    /// optionally `fsfreeze`) the rootfs before the disk clone, producing a
+    /// clean point-in-time image. Stopped sandboxes skip quiesce regardless
+    /// (nothing to flush). When quiesce is explicitly skipped on a running
+    /// sandbox, the disk clone is crash-consistent — filesystem journal
+    /// replays on next boot, but in-flight application writes can be torn.
     pub fn snapshot(&self, id: &SandboxId, opts: SnapshotOptions) -> Result<SnapshotId> {
         let stored = self.load(id)?;
         let snap_id = match opts.name {
@@ -664,11 +669,37 @@ impl SandboxManager {
         fs::create_dir_all(&snapshots_root).map_err(|err| Error::io_path(&snapshots_root, err))?;
         fs::create_dir(&snap_dir).map_err(|err| Error::io_path(&snap_dir, err))?;
 
+        let quiesce_timeout = opts.quiesce_timeout.unwrap_or(Duration::from_secs(10));
+        let should_quiesce = !opts.skip_quiesce && self.is_running(id);
+        let quiesce_action = if opts.quiesce_freeze {
+            QuiesceAction::Freeze
+        } else {
+            QuiesceAction::Sync
+        };
+
         let outcome = (|| -> Result<()> {
-            // Clone the root disk. On macOS this is an APFS copy-on-write
-            // clone (~5 ms regardless of disk size).
+            // Hold the quiesce ticket across the disk clone so the guest
+            // stays flushed/frozen for the duration. `ticket.take()` below
+            // releases explicitly so the wrapper can surface release errors;
+            // if `clone_or_copy_root` fails first, `?` short-circuits and
+            // the ticket's `Drop` sends a best-effort `resume.req` so the
+            // guest never stays frozen because of a Rust early return.
+            let mut ticket = if should_quiesce {
+                Some(
+                    QuiesceClient::new(&stored.runtime_control)
+                        .freeze(quiesce_action, quiesce_timeout)?,
+                )
+            } else {
+                None
+            };
+            let achieved_unix_millis = ticket.as_ref().map(|t| t.achieved_unix_millis());
+
             let root_dst = snap_dir.join("root.raw");
             clone_or_copy_root(&stored.root_disk, &root_dst)?;
+
+            if let Some(t) = ticket.take() {
+                t.release(quiesce_timeout)?;
+            }
 
             // Bundle credentials staging so a later restore can mount the
             // same auth material without re-reading host secrets.
@@ -697,6 +728,13 @@ impl SandboxManager {
                 network_backend: stored.network_backend.clone(),
                 network_proxy: stored.network_proxy.clone(),
                 had_credentials,
+                quiesced: should_quiesce,
+                quiesce_action: if should_quiesce {
+                    Some(quiesce_action.as_str().to_string())
+                } else {
+                    None
+                },
+                quiesced_unix_millis: achieved_unix_millis,
             };
             let manifest_path = snap_dir.join("manifest.json");
             fs::write(&manifest_path, manifest.to_json())
@@ -1894,6 +1932,7 @@ mod tests {
                 &sandbox.id,
                 SnapshotOptions {
                     name: Some("my-snap".to_string()),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -1910,6 +1949,7 @@ mod tests {
 
         let opts = SnapshotOptions {
             name: Some("dup".to_string()),
+            ..Default::default()
         };
         manager.snapshot(&sandbox.id, opts.clone()).unwrap();
         let err = manager.snapshot(&sandbox.id, opts).unwrap_err();
@@ -2147,6 +2187,7 @@ mod tests {
                 &sandbox.id,
                 SnapshotOptions {
                     name: Some("a".to_string()),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -2155,6 +2196,7 @@ mod tests {
                 &sandbox.id,
                 SnapshotOptions {
                     name: Some("b".to_string()),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -2189,5 +2231,230 @@ mod tests {
         assert!(!dir.exists());
         let err = manager.delete_snapshot(&snap_id).unwrap_err();
         assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    // -- cooperative quiesce on running snapshots ----------------------------
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// Mark a sandbox as running by writing a `running.json` marker whose PID
+    /// is the current test process — `pid_is_running` will return true for
+    /// the lifetime of the test.
+    fn mark_running(manager: &SandboxManager, sandbox: &Sandbox) {
+        ResourceLedger::from_env(&manager.state_root)
+            .record_running(
+                &sandbox.state_dir,
+                sandbox.id.as_str(),
+                std::process::id(),
+                0,
+            )
+            .unwrap();
+    }
+
+    /// Spawn a thread that plays the in-guest quiesce daemon on
+    /// `runtime_control`. Mirrors the real `agent-sandbox-quiesce` script:
+    /// reads `quiesce.req`, writes `quiesce.ack`, waits for `resume.req`,
+    /// writes `resume.ack`. Exits when `stop` is set.
+    fn spawn_quiesce_fake_guest(runtime_control: PathBuf, stop: Arc<AtomicBool>) {
+        std::thread::spawn(move || {
+            let read_field = |path: &Path, key: &str| -> Option<String> {
+                let text = fs::read_to_string(path).ok()?;
+                for line in text.lines() {
+                    let line = line.trim();
+                    if let Some(value) = line.strip_prefix(&format!("{key}=")) {
+                        return Some(value.to_string());
+                    }
+                }
+                None
+            };
+            let write_atomic = |path: &Path, content: &str| {
+                let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+                fs::write(&tmp, content).unwrap();
+                fs::rename(&tmp, path).unwrap();
+            };
+
+            let mut handled_quiesce_id: Option<String> = None;
+            while !stop.load(Ordering::SeqCst) {
+                if handled_quiesce_id.is_none() {
+                    let req_path = runtime_control.join("quiesce.req");
+                    if let Some(id) = read_field(&req_path, "id") {
+                        let action =
+                            read_field(&req_path, "action").unwrap_or_else(|| "sync".to_string());
+                        let ack = format!(
+                            "id={id}\nstatus=ok\naction={action}\nachieved_unix_millis={}\n",
+                            unix_millis()
+                        );
+                        write_atomic(&runtime_control.join("quiesce.ack"), &ack);
+                        handled_quiesce_id = Some(id);
+                    }
+                } else {
+                    let resume_path = runtime_control.join("resume.req");
+                    if let Some(id) = read_field(&resume_path, "id") {
+                        let ack = format!(
+                            "id={id}\nstatus=ok\nresumed_unix_millis={}\n",
+                            unix_millis()
+                        );
+                        write_atomic(&runtime_control.join("resume.ack"), &ack);
+                        // Sweep so a follow-on cycle on the same dir starts
+                        // clean (matches what the real daemon does).
+                        let _ = fs::remove_file(runtime_control.join("quiesce.req"));
+                        let _ = fs::remove_file(runtime_control.join("resume.req"));
+                        handled_quiesce_id = None;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+    }
+
+    #[test]
+    fn snapshot_of_running_sandbox_quiesces_before_clone() {
+        let (manager, image) = snapshot_fixture("quiesce-running");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        let sandbox = manager.create(config).unwrap();
+        mark_running(&manager, &sandbox);
+
+        let runtime_control = sandbox.state_dir.join("runtime-control");
+        let stop = Arc::new(AtomicBool::new(false));
+        spawn_quiesce_fake_guest(runtime_control.clone(), stop.clone());
+
+        // Default options use freeze action; the real guest would downgrade
+        // to sync — the fake guest echoes back whatever action it was asked
+        // for, which is fine for protocol verification.
+        let snap_id = manager
+            .snapshot(&sandbox.id, SnapshotOptions::default())
+            .unwrap();
+        stop.store(true, Ordering::SeqCst);
+
+        let manifest_json = manager.inspect_snapshot(&snap_id).unwrap();
+        let manifest = crate::snapshot::SnapshotManifest::from_json(&manifest_json).unwrap();
+        assert!(
+            manifest.quiesced,
+            "running sandbox snapshot should set quiesced=true; manifest: {manifest_json}"
+        );
+        assert_eq!(manifest.quiesce_action.as_deref(), Some("freeze"));
+        assert!(manifest.quiesced_unix_millis.is_some());
+    }
+
+    #[test]
+    fn snapshot_records_sync_action_when_freeze_disabled() {
+        let (manager, image) = snapshot_fixture("quiesce-sync-action");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        let sandbox = manager.create(config).unwrap();
+        mark_running(&manager, &sandbox);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        spawn_quiesce_fake_guest(sandbox.state_dir.join("runtime-control"), stop.clone());
+
+        let snap_id = manager
+            .snapshot(
+                &sandbox.id,
+                SnapshotOptions {
+                    quiesce_freeze: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        stop.store(true, Ordering::SeqCst);
+
+        let manifest = crate::snapshot::SnapshotManifest::from_json(
+            &manager.inspect_snapshot(&snap_id).unwrap(),
+        )
+        .unwrap();
+        assert!(manifest.quiesced);
+        assert_eq!(manifest.quiesce_action.as_deref(), Some("sync"));
+    }
+
+    #[test]
+    fn snapshot_skip_quiesce_does_not_touch_runtime_control() {
+        let (manager, image) = snapshot_fixture("quiesce-skip");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        let sandbox = manager.create(config).unwrap();
+        mark_running(&manager, &sandbox);
+
+        // No fake guest — if quiesce ran, the snapshot would time out.
+        let snap_id = manager
+            .snapshot(
+                &sandbox.id,
+                SnapshotOptions {
+                    skip_quiesce: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let manifest = crate::snapshot::SnapshotManifest::from_json(
+            &manager.inspect_snapshot(&snap_id).unwrap(),
+        )
+        .unwrap();
+        assert!(!manifest.quiesced);
+        assert_eq!(manifest.quiesce_action, None);
+        assert_eq!(manifest.quiesced_unix_millis, None);
+        // The wrapper should not have created any quiesce.* files when
+        // skipping (the runtime-control dir stays clean).
+        let rc = sandbox.state_dir.join("runtime-control");
+        assert!(!rc.join("quiesce.req").exists());
+        assert!(!rc.join("quiesce.ack").exists());
+    }
+
+    #[test]
+    fn snapshot_of_stopped_sandbox_skips_quiesce_silently() {
+        // The pre-existing snapshot_writes_manifest_and_clones_disk test
+        // covers the happy path for stopped sandboxes; here we just assert
+        // the manifest fields reflect "no quiesce" without an explicit opt-
+        // out (because is_running() returned false).
+        let (manager, image) = snapshot_fixture("quiesce-stopped");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        let sandbox = manager.create(config).unwrap();
+        // Note: no mark_running.
+
+        let snap_id = manager
+            .snapshot(&sandbox.id, SnapshotOptions::default())
+            .unwrap();
+        let manifest = crate::snapshot::SnapshotManifest::from_json(
+            &manager.inspect_snapshot(&snap_id).unwrap(),
+        )
+        .unwrap();
+        assert!(!manifest.quiesced);
+        assert_eq!(manifest.quiesce_action, None);
+    }
+
+    #[test]
+    fn snapshot_of_running_sandbox_fails_when_guest_unresponsive() {
+        let (manager, image) = snapshot_fixture("quiesce-timeout");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        let sandbox = manager.create(config).unwrap();
+        mark_running(&manager, &sandbox);
+        // No fake guest spawned: the daemon never acks the quiesce.req.
+
+        let err = manager
+            .snapshot(
+                &sandbox.id,
+                SnapshotOptions {
+                    name: Some("doomed".to_string()),
+                    quiesce_timeout: Some(Duration::from_millis(200)),
+                    ..Default::default()
+                },
+            )
+            .expect_err("snapshot should fail when guest does not ack quiesce");
+        assert!(
+            err.to_string().contains("quiesce.ack") || err.to_string().contains("guest quiesce"),
+            "got error: {err}"
+        );
+        // Snapshot directory must be cleaned up on failure.
+        let snap_id = SnapshotId::new("doomed").unwrap();
+        assert!(!manager.snapshot_dir(&snap_id).exists());
+        // Best-effort resume.req was still written (defense-in-depth so the
+        // guest unfreezes if it later wakes up).
+        assert!(sandbox
+            .state_dir
+            .join("runtime-control/resume.req")
+            .exists());
     }
 }

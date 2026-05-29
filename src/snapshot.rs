@@ -44,6 +44,7 @@ use crate::credentials::escape_json;
 use crate::error::{Error, Result};
 use crate::image::{json_bool, json_number, json_string, json_string_array};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Validated identifier for a snapshot directory under `<state>/snapshots/`.
 ///
@@ -132,6 +133,18 @@ pub struct SnapshotManifest {
 
     /// True when `credentials-staging/` is present in the snapshot directory.
     pub had_credentials: bool,
+
+    /// True iff the snapshot was taken with cooperative quiesce on a running
+    /// sandbox (filesystems were flushed / optionally frozen before the disk
+    /// clone). False for snapshots of stopped sandboxes (nothing to flush) and
+    /// for snapshots taken with `skip_quiesce` (crash-consistent).
+    pub quiesced: bool,
+    /// Which quiesce action ran: `"freeze"` or `"sync"`. `None` when
+    /// `quiesced` is false.
+    pub quiesce_action: Option<String>,
+    /// When the guest acknowledged quiescence, in unix milliseconds. `None`
+    /// when `quiesced` is false.
+    pub quiesced_unix_millis: Option<u128>,
 }
 
 impl SnapshotManifest {
@@ -181,6 +194,9 @@ impl SnapshotManifest {
                 "  \"proxy_header_rules\": [{rules}],\n",
                 "  \"workspace_mounts\": [{mounts}],\n",
                 "  \"had_credentials\": {had_credentials},\n",
+                "  \"quiesced\": {quiesced},\n",
+                "  \"quiesce_action\": \"{quiesce_action}\",\n",
+                "  \"quiesced_unix_millis\": {quiesced_unix_millis},\n",
                 "  \"note\": \"disk-only snapshot; guest memory and live processes are not preserved\"\n",
                 "}}\n"
             ),
@@ -201,6 +217,9 @@ impl SnapshotManifest {
             rules = rules,
             mounts = mounts,
             had_credentials = self.had_credentials,
+            quiesced = self.quiesced,
+            quiesce_action = escape_json(self.quiesce_action.as_deref().unwrap_or("")),
+            quiesced_unix_millis = self.quiesced_unix_millis.unwrap_or(0),
         )
     }
 
@@ -241,6 +260,21 @@ impl SnapshotManifest {
                 header_rules,
             },
             had_credentials: json_bool(json, "had_credentials").unwrap_or(false),
+            quiesced: json_bool(json, "quiesced").unwrap_or(false),
+            quiesce_action: json_string(json, "quiesce_action").and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }),
+            quiesced_unix_millis: json_number(json, "quiesced_unix_millis").and_then(|v| {
+                if v == 0 {
+                    None
+                } else {
+                    Some(v as u128)
+                }
+            }),
         })
     }
 }
@@ -258,10 +292,40 @@ pub struct SnapshotSummary {
 }
 
 /// Options for `SandboxManager::snapshot`.
-#[derive(Debug, Clone, Default)]
+///
+/// Quiesce defaults — see [`crate::quiesce`] for the protocol:
+/// - `skip_quiesce = false`: snapshots of *running* sandboxes ask the
+///   in-guest daemon to flush before the disk clone. Snapshots of stopped
+///   sandboxes skip quiesce regardless (nothing to flush).
+/// - `quiesce_freeze = true`: use `fsfreeze` for a strict quiescent rootfs.
+///   Set to `false` for `sync`-only when the rootfs does not support
+///   `fsfreeze` (e.g. tmpfs).
+/// - `quiesce_timeout = None`: 10 seconds default. Increase for very busy
+///   guests or slow `sync` flushes.
+#[derive(Debug, Clone)]
 pub struct SnapshotOptions {
     /// Override the auto-generated snapshot ID. Validated as a SnapshotId.
     pub name: Option<String>,
+    /// Skip cooperative quiesce. The disk clone is crash-consistent
+    /// (filesystem journal replay on next boot). Stopped sandboxes already
+    /// skip quiesce regardless of this flag.
+    pub skip_quiesce: bool,
+    /// Per-side timeout for the freeze and resume RPCs. `None` uses the
+    /// default 10 seconds.
+    pub quiesce_timeout: Option<Duration>,
+    /// Use `fsfreeze -f /` when quiescing. Set to `false` for `sync`-only.
+    pub quiesce_freeze: bool,
+}
+
+impl Default for SnapshotOptions {
+    fn default() -> Self {
+        Self {
+            name: None,
+            skip_quiesce: false,
+            quiesce_timeout: None,
+            quiesce_freeze: true,
+        }
+    }
 }
 
 /// Options for `SandboxManager::restore`. Every field is an override; the
@@ -466,6 +530,9 @@ mod tests {
                 }],
             },
             had_credentials: true,
+            quiesced: true,
+            quiesce_action: Some("freeze".to_string()),
+            quiesced_unix_millis: Some(1_700_000_001_500),
         }
     }
 
@@ -501,6 +568,22 @@ mod tests {
             "api.example.test"
         );
         assert!(parsed.had_credentials);
+        assert!(parsed.quiesced);
+        assert_eq!(parsed.quiesce_action.as_deref(), Some("freeze"));
+        assert_eq!(parsed.quiesced_unix_millis, Some(1_700_000_001_500));
+    }
+
+    #[test]
+    fn manifest_round_trip_without_quiesce_keeps_none_fields() {
+        let mut original = sample_manifest();
+        original.quiesced = false;
+        original.quiesce_action = None;
+        original.quiesced_unix_millis = None;
+        let json = original.to_json();
+        let parsed = SnapshotManifest::from_json(&json).unwrap();
+        assert!(!parsed.quiesced);
+        assert_eq!(parsed.quiesce_action, None);
+        assert_eq!(parsed.quiesced_unix_millis, None);
     }
 
     #[test]

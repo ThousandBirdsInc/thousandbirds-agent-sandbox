@@ -135,11 +135,16 @@ mkdir -p \
   "$overlay_dir/root/etc/systemd/system/multi-user.target.wants"
 cp "$ROOT_DIR/guest/agent-sandbox-import-credentials" "$overlay_dir/root/usr/local/bin/"
 cp "$ROOT_DIR/guest/agent-sandbox-shell" "$overlay_dir/root/usr/local/bin/"
+cp "$ROOT_DIR/guest/agent-sandbox-quiesce" "$overlay_dir/root/usr/local/bin/"
 sed "s|@SERIAL_TTY@|/dev/$console|g" \
   "$ROOT_DIR/guest/agent-sandbox-shell.service" \
   > "$overlay_dir/root/etc/systemd/system/agent-sandbox-shell.service"
+cp "$ROOT_DIR/guest/agent-sandbox-quiesce.service" \
+  "$overlay_dir/root/etc/systemd/system/agent-sandbox-quiesce.service"
 ln -sf ../agent-sandbox-shell.service \
   "$overlay_dir/root/etc/systemd/system/multi-user.target.wants/agent-sandbox-shell.service"
+ln -sf ../agent-sandbox-quiesce.service \
+  "$overlay_dir/root/etc/systemd/system/multi-user.target.wants/agent-sandbox-quiesce.service"
 # Mask the deprecated systemd-udev-settle.service. On a virtio guest with
 # devtmpfs, devices appear synchronously, so the settle barrier only adds
 # startup latency on the critical path to sysinit.target.
@@ -147,8 +152,11 @@ ln -sf /dev/null \
   "$overlay_dir/root/etc/systemd/system/systemd-udev-settle.service"
 chmod 0755 \
   "$overlay_dir/root/usr/local/bin/agent-sandbox-import-credentials" \
-  "$overlay_dir/root/usr/local/bin/agent-sandbox-shell"
-chmod 0644 "$overlay_dir/root/etc/systemd/system/agent-sandbox-shell.service"
+  "$overlay_dir/root/usr/local/bin/agent-sandbox-shell" \
+  "$overlay_dir/root/usr/local/bin/agent-sandbox-quiesce"
+chmod 0644 \
+  "$overlay_dir/root/etc/systemd/system/agent-sandbox-shell.service" \
+  "$overlay_dir/root/etc/systemd/system/agent-sandbox-quiesce.service"
 (cd "$overlay_dir/root" && tar -cpf "$overlay_tar" .)
 
 kernel=${KERNEL:-}
