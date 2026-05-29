@@ -329,14 +329,69 @@ or a wedged guest. Failure modes are covered by tests:
 mode (and its on-VM checksum-while-writing test from the original exit
 criteria) remains the small follow-on.
 
-#### Phase 3 — HVF memory + vCPU + device capture [krun-heavy] — SCAFFOLDED (libkrun core impl pending)
+#### Phase 3 — HVF memory + vCPU + device capture [krun-heavy] — PARTIAL (Phases A, B, D + Phase C leaf primitives landed; runtime orchestration pending)
 
 Goal: a real snapshot. This is the work
 `thousandbirds-libkrun/design_docs/snapshot_restore.md` audits but does not
 schedule. Order intentionally matches that audit's "HVF first" recommendation
 since macOS is the hard host requirement.
 
-What landed (wrapper-side + libkrun-side planning):
+**Second pass — what landed in libkrun itself** (sibling repo
+`thousandbirds-libkrun`, branch `snapshot-restore-implementation-plan`):
+
+- **Phase A (foundations) — DONE.** New `src/vmm/src/snapshot/` module:
+  `SnapshotableVm` / `SnapshotableVcpu` traits, `VmStateV1` / `VcpuStateV1`
+  versioned + backend-tagged state containers with hand-rolled binary
+  serialization (no new dependencies), `SnapshotError` typed errors,
+  `MemoryImageWriter` / `MemoryImageReader` with sparse-file zero-page
+  punching. 12 unit tests pass (state round-trip, version mismatch,
+  bad magic, sparse round-trip, multi-region ordering, finalize
+  invariants).
+- **Phase B (KVM x86_64 capture) — DONE on Linux.** `impl SnapshotableVm
+  for Vm` and `impl SnapshotableVcpu for Vcpu` in
+  `src/vmm/src/linux/vstate.rs` wrapping the existing private
+  `save_state` / `restore_state`. Byte format uses unsafe transmute on
+  `#[repr(C)]` kvm-bindings POD structs (sound — they are kernel-ABI
+  FFI types with no Rust invariants) plus length-prefixed encoding for
+  FAM types (`Msrs`, `CpuId`). Verified compile-clean on macOS host;
+  end-to-end test requires a KVM Linux runner (out of scope this
+  session per the design doc's "Linux/KVM runtime gates remain
+  deferred until a Linux host or CI runner with /dev/kvm is
+  available").
+- **Phase C (HVF capture) — LEAF DONE, ORCHESTRATION PENDING.**
+  - Leaf: new `HvfVcpuState` struct + `HvfVcpu::save_state` /
+    `restore_state` methods in `src/hvf/src/lib.rs`. Captures general
+    regs (X0–X30, PC, FPCR, FPSR, CPSR), SP_EL0/SP_EL1, Q0–Q31 SIMD,
+    and a fixed list of 22 system registers covering MMU/exception/
+    debug/thread-pointer/virtual-timer state. 3 unit tests pass
+    (round-trip, magic, size mismatch).
+  - VM-level: `impl SnapshotableVm for macos::Vm` returns an empty
+    payload tagged hvf/aarch64 — GICv3 capture is the documented
+    Phase C.3 follow-on; the snapshot site validates "no pending
+    interrupts" as a precondition.
+  - Vcpu-level: `impl SnapshotableVcpu for macos::Vcpu` returns
+    `UnsupportedBackend` with a specific message pointing at Phase
+    C.4 — capturing requires sending a Snapshot event over the
+    existing `VcpuEvent` channel and having the running vCPU thread
+    pause itself and call `HvfVcpu::save_state` from its own context
+    (HVF rejects register get/set on a running vCPU). This is the
+    one remaining piece of HVF capture that requires real
+    architectural work in the vCPU thread loop.
+- **Phase D (C API + os_mode) — ABI RESERVED.**
+  - `include/libkrun.h` and `src/libkrun/src/lib.rs`: new C ABI
+    symbols `krun_set_snapshot_restore_from(ctx, path)` and
+    `krun_snapshot_to_path(ctx, path)`. The former records the path
+    (returns 0); the latter returns `-ENOSYS` pending the in-VM
+    orchestration. ContextConfig gained a `snapshot_restore_from`
+    field that survives across `krun_set_*` calls and is available
+    for the future `krun_start_enter` restore branch.
+  - `examples/os_mode.c`: new `--restore PATH` and `--snapshot-out
+    PATH` flags, wired through the new C ABI. `--restore` records
+    the path into the context before `krun_start_enter`, so when
+    the libkrun restore execution lands no os_mode change is
+    required to consume it.
+
+**First pass — wrapper-side scaffolding** (this repo, prior commit):
 
 - **`thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md`**
   (new): turns the existing audit into a scheduled, file-pathed implementation
@@ -439,7 +494,34 @@ advanced (no time stall observable to a userspace clock). Wall-clock restore
 time on the macOS dev machine is < 200 ms for a 2048 MiB VM with a 256 MiB
 working set (sparse memory image, mmap restore).
 
-**What remains for full Phase 3:** the libkrun-side capture path itself.
+**What remains for full Phase 3:**
+
+1. **Phase C.3** — GICv3 distributor + redistributor state capture in
+   `src/hvf/src/lib.rs` (and matching read in `HvfVm::save_state`). The
+   wrapper-level "no pending interrupts" precondition is a workable
+   bridge until this lands.
+2. **Phase C.4** — vCPU-thread Pause + Snapshot + Restore event handling
+   in `src/vmm/src/macos/vstate.rs`. Today the vCPU thread loop
+   (`pub fn run`) does not poll the `event_receiver`; adding Pause/
+   Snapshot/Resume handling that calls `HvfVcpu::save_state` from the
+   thread's own context is the largest remaining piece.
+3. **Phase D runtime** — `krun_snapshot_to_path` body in
+   `src/libkrun/src/lib.rs` (pause vCPUs, snapshot via the
+   `SnapshotableVm` / `SnapshotableVcpu` traits, write
+   `VmStateV1` + `VcpuStateV1` + `MemoryImage` files); restore branch
+   in `krun_start_enter` (read files, reconstruct via traits, mmap
+   memory, resume after vCPUs are restored).
+4. **Wrapper flip** — `SandboxManager::snapshot` `capture_memory=true`
+   branch from "return typed error" to "issue snapshot RPC over the
+   existing control socket and capture the response path"; symmetric
+   flip on the restore-Full guard.
+
+Each is a small, focused change against the now-stable libkrun ABI.
+The whole point of the surface, traits, leaf primitives, and ABI
+reservations that landed in this session is to make each remaining
+piece an independent commit rather than one giant integration push.
+
+**Original framing — what remains for full Phase 3:** the libkrun-side capture path itself.
 The implementation plan in
 [`thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md`](../../thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md)
 breaks this into Phases A–D with effort estimates (~3–5 days, 2 weeks,

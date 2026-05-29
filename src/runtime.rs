@@ -670,12 +670,26 @@ impl SandboxManager {
         // producing a disk-only snapshot — the caller would otherwise believe
         // memory was captured.
         if opts.capture_memory {
+            // Phase 3 surface check. The wrapper-side surface is wired
+            // through (SnapshotOptions::capture_memory, manifest's `Full`
+            // kind, LaunchConfig::restore_from for the reverse path). The
+            // libkrun side ships `krun_snapshot_to_path` as a reserved C
+            // ABI symbol that returns -ENOSYS until the vCPU-thread
+            // orchestration lands — see
+            // `../thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md`
+            // (Phase D). When that ships, this branch flips from "return
+            // typed error" to "send snapshot-memory RPC over the control
+            // socket". No shape change required.
             return Err(Error::InvalidArgument(format!(
-                "snapshot of sandbox {id} requested capture_memory=true, but this \
-                 libkrun build does not yet support memory + vCPU capture. The \
-                 Rust surface accepts the option so callers can integrate today; \
-                 disk-only snapshots work with capture_memory=false. Tracking: \
-                 docs/closing-the-smolvm-gap-plan.md Phase 3."
+                "snapshot of sandbox {id} requested capture_memory=true, but the \
+                 libkrun snapshot orchestration is -ENOSYS in this build. The \
+                 wrapper-side plumbing is in place; the libkrun-side C API \
+                 symbols (krun_snapshot_to_path / krun_set_snapshot_restore_from) \
+                 are reserved and the type surface compiled, awaiting vCPU-thread \
+                 Pause+Snapshot event orchestration. Track: \
+                 docs/closing-the-smolvm-gap-plan.md Phase 3 + \
+                 ../thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md \
+                 §Phase D."
             )));
         }
         let snap_id = match opts.name {
@@ -795,6 +809,29 @@ impl SandboxManager {
         let manifest_json = fs::read_to_string(&manifest_path)
             .map_err(|err| Error::io_path(&manifest_path, err))?;
         let manifest = SnapshotManifest::from_json(&manifest_json)?;
+        // Phase 3 symmetry: a Full-kind snapshot expects the wrapper to
+        // route the launcher invocation through LaunchConfig::restore_from
+        // so libkrun rebuilds vCPU + memory state instead of cold-booting.
+        // The wrapper-side plumbing is in place
+        // (src/libkrun.rs LaunchConfig::restore_from emits --restore PATH),
+        // and the libkrun-side C ABI symbol `krun_set_snapshot_restore_from`
+        // is reserved, but the actual restore execution in libkrun is
+        // pending (returns -ENOSYS until the orchestration ships). Refuse
+        // here rather than silently cold-booting from the snapshot's disk
+        // and discarding the captured memory — that would deceive the
+        // caller into believing they got a process-preserving restore.
+        if manifest.kind == SnapshotKind::Full {
+            return Err(Error::InvalidArgument(format!(
+                "snapshot {snap_id} is a Full-kind (memory + vCPU state) artifact \
+                 but this build cannot yet restore from it: libkrun's runtime \
+                 restore execution is -ENOSYS. The wrapper-side plumbing is in \
+                 place (LaunchConfig::restore_from emits --restore PATH to the \
+                 launcher; the C ABI symbol krun_set_snapshot_restore_from is \
+                 reserved). Track: \
+                 ../thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md \
+                 §Phase D."
+            )));
+        }
 
         let new_id = match &opts.name {
             Some(name) => SandboxId::new(sanitize_id(name))?,
@@ -2454,6 +2491,46 @@ mod tests {
     }
 
     // -- Phase 3 surface (memory snapshot) -----------------------------------
+
+    #[test]
+    fn restore_of_full_kind_snapshot_returns_typed_error_today() {
+        // Phase 3 symmetric guard: a Full-kind manifest (memory snapshot)
+        // is refused at restore time rather than silently cold-booting
+        // from the disk and discarding the captured memory.
+        let (manager, image) = snapshot_fixture("restore-full-unimplemented");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        let sandbox = manager.create(config).unwrap();
+        let snap_id = manager
+            .snapshot(
+                &sandbox.id,
+                SnapshotOptions {
+                    name: Some("masquerade".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Forge a Full-kind manifest on disk — simulates a snapshot
+        // captured by a future libkrun that supports memory capture.
+        let manifest_path = manager.snapshot_dir(&snap_id).join("manifest.json");
+        let json = fs::read_to_string(&manifest_path).unwrap();
+        let forged = json
+            .replace("\"kind\": \"disk-only\"", "\"kind\": \"full\"")
+            .replace(
+                "\"memory_image_path\": \"\"",
+                "\"memory_image_path\": \"memory.bin\"",
+            );
+        fs::write(&manifest_path, forged).unwrap();
+
+        let err = manager
+            .restore(&snap_id, RestoreOptions::default())
+            .expect_err("restore of Full-kind should fail loudly today");
+        assert!(
+            err.to_string().contains("Full-kind") && err.to_string().contains("ENOSYS"),
+            "got: {err}"
+        );
+    }
 
     #[test]
     fn snapshot_with_capture_memory_returns_typed_error_today() {
