@@ -626,7 +626,32 @@ through Homebrew if not), then do
 
 ---
 
-## G3 — Browser-In-Sandbox
+## G3 — Browser-In-Sandbox — IMPLEMENTED
+
+Landed in this commit:
+
+- New agent image variant `debian-bookworm-browser` (`images/debian-bookworm-browser.Containerfile`) — chromium + display stack (Xvfb + x11vnc + fluxbox + fonts-liberation + fonts-noto-color-emoji). `scripts/build-agent-image.sh debian-bookworm-browser` builds it on top of the base image.
+- New guest script `guest/agent-sandbox-browser` with `start [--headless|--headed] [--cdp-port N] [--vnc-port N] [--profile DIR]`, `status`, and `stop` subcommands. Idempotent (re-invoking `start` while the browser is up just re-prints status). POSIX sh, syntax-checked by the verification gate. Installed unconditionally on every variant — no-ops with a clear error if chromium is not present.
+- New CLI subcommand group `tb-sandbox browser start|view|status|stop SANDBOX_ID`. `start` and `view` stay in the foreground holding host-side port forwards (CDP, and VNC when `--headed`) — Ctrl-C tears them down and stops the in-guest browser. `status` and `stop` are one-shot calls.
+- Uses the existing `SandboxManagerSdk::exec` + `SandboxManagerSdk::forward_port` machinery; no new transport, no new daemon process, no new state files.
+- Worked end-to-end example in README (headless CDP automation with `chrome-remote-interface`, plus headed VNC viewing via macOS Screen Sharing).
+
+What this does NOT do (deliberate; small follow-ons):
+
+- No per-browser-egress allowlist. The browser inherits the sandbox's
+  network proxy config; restricting browser traffic to specific domains
+  is the same wrapper-level proxy feature that applies to every workload.
+- No baked-in puppeteer / playwright bindings. The CDP URL is what's
+  exposed; the agent picks its own client.
+- No automatic VNC viewer launch — `browser view` prints the URL and
+  expects the user to open it (Screen Sharing on macOS handles
+  `vnc://` URLs natively; Linux users pipe to their preferred client).
+
+**Original plan estimate: 2–3 weeks. Shipped in one session because the
+existing SDK already had `exec` + `forward_port` so the host-side
+orchestration was a thin wrapper rather than a new transport.**
+
+### Original design (kept for reference)
 
 ### Why this is a guest-image problem, not a VMM problem
 
@@ -706,7 +731,8 @@ Original plan, calendar order if one engineer works end-to-end:
 2. **G1 Phase 1 (artifact + cold-boot-replay restore + fork)** — 1–2 weeks. **DONE.**
 3. **G1 Phase 2 (quiescence)** — 1 week. **DONE (sync-mode; freeze deferred).**
 4. **G3 browser image + VNC viewer** — 2–3 weeks. Independent of G1
-   Phases 3/4, can interleave.
+   Phases 3/4, can interleave. **DONE in 1 session** (existing SDK
+   `exec`+`forward_port` collapsed most of the planned scope).
 5. **G1 Phase 3 (HVF capture/restore)** — 6–10 weeks. The hard one. Owns
    most of the calendar. **WRAPPER-SIDE SCAFFOLDING DONE; libkrun-side core
    implementation (Phases A–D of the libkrun design doc) pending.**

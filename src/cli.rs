@@ -158,6 +158,41 @@ pub fn run(args: Vec<String>) -> Result<()> {
             println!("{}", sandbox.state_dir.display());
             Ok(())
         }
+        "browser" => {
+            // Sub-dispatch on the next token. Each subcommand drives the
+            // SDK to exec agent-sandbox-browser in the guest plus (for
+            // start/view) holds a port forward open for the lifetime of
+            // the command. SIGINT cleans up the forward and stops the
+            // browser cleanly.
+            let sub = args.next().ok_or_else(|| {
+                Error::InvalidArgument(
+                    "tb-sandbox browser requires a subcommand: start|stop|status|view".to_string(),
+                )
+            })?;
+            match sub.as_str() {
+                "start" => {
+                    let id = required_id(args.next(), "browser start")?;
+                    let opts = parse_browser_start_options(args.collect())?;
+                    run_browser_start(id, opts)
+                }
+                "view" => {
+                    let id = required_id(args.next(), "browser view")?;
+                    let opts = parse_browser_view_options(args.collect())?;
+                    run_browser_view(id, opts)
+                }
+                "stop" => {
+                    let id = required_id(args.next(), "browser stop")?;
+                    run_browser_simple(id, vec!["stop".to_string()])
+                }
+                "status" => {
+                    let id = required_id(args.next(), "browser status")?;
+                    run_browser_simple(id, vec!["status".to_string()])
+                }
+                other => Err(Error::InvalidArgument(format!(
+                    "unknown browser subcommand: {other}"
+                ))),
+            }
+        }
         "help" | "--help" | "-h" => {
             print_help(&program);
             Ok(())
@@ -260,6 +295,231 @@ fn parse_restore_options(args: Vec<String>) -> Result<RestoreOptions> {
     }
     opts.workspace_mounts = workspace_override;
     Ok(opts)
+}
+
+// --- browser subcommand ----------------------------------------------------
+
+#[derive(Default)]
+struct BrowserStartOptions {
+    headed: bool,
+    cdp_port: Option<u16>,
+    vnc_port: Option<u16>,
+    profile: Option<String>,
+    /// Skip opening the browser command — useful when the caller just wants
+    /// the port-forward loop without invoking start.
+    skip_start: bool,
+}
+
+#[derive(Default)]
+struct BrowserViewOptions {
+    cdp_port: Option<u16>,
+    vnc_port: Option<u16>,
+    profile: Option<String>,
+    /// If set, do not try to spawn a local VNC client; just print the URL.
+    no_open: bool,
+}
+
+fn parse_browser_start_options(args: Vec<String>) -> Result<BrowserStartOptions> {
+    let mut opts = BrowserStartOptions::default();
+    let mut iter = args.into_iter().peekable();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--headless" => opts.headed = false,
+            "--headed" => opts.headed = true,
+            "--cdp-port" => {
+                opts.cdp_port = Some(parse_port(&next_value(&mut iter, "--cdp-port")?)?);
+            }
+            "--vnc-port" => {
+                opts.vnc_port = Some(parse_port(&next_value(&mut iter, "--vnc-port")?)?);
+            }
+            "--profile" => opts.profile = Some(next_value(&mut iter, "--profile")?),
+            "--no-start" => opts.skip_start = true,
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "unexpected argument to browser start: {other}"
+                )));
+            }
+        }
+    }
+    Ok(opts)
+}
+
+fn parse_browser_view_options(args: Vec<String>) -> Result<BrowserViewOptions> {
+    let mut opts = BrowserViewOptions::default();
+    let mut iter = args.into_iter().peekable();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--cdp-port" => {
+                opts.cdp_port = Some(parse_port(&next_value(&mut iter, "--cdp-port")?)?);
+            }
+            "--vnc-port" => {
+                opts.vnc_port = Some(parse_port(&next_value(&mut iter, "--vnc-port")?)?);
+            }
+            "--profile" => opts.profile = Some(next_value(&mut iter, "--profile")?),
+            "--no-open" => opts.no_open = true,
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "unexpected argument to browser view: {other}"
+                )));
+            }
+        }
+    }
+    Ok(opts)
+}
+
+fn parse_port(value: &str) -> Result<u16> {
+    value
+        .parse::<u16>()
+        .map_err(|_| Error::InvalidArgument(format!("port must be 1..=65535, got {value}")))
+}
+
+const GUEST_BROWSER_BIN: &str = "/usr/local/bin/agent-sandbox-browser";
+
+/// Run agent-sandbox-browser <args> in the guest; print combined output
+/// (its key=value status / start results) and return.
+fn run_browser_simple(id: SandboxId, browser_args: Vec<String>) -> Result<()> {
+    sdk_block_on(|sdk| async move {
+        let mut argv = vec![GUEST_BROWSER_BIN.to_string()];
+        argv.extend(browser_args);
+        let mut process = sdk.exec(&id, GuestCommand::new(argv)).await?;
+        let mut exit_rx = process.exit;
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let mut exit = None;
+        loop {
+            tokio::select! {
+                line = process.stdout.recv(), if stdout_open => match line {
+                    Some(line) => println!("{line}"),
+                    None => stdout_open = false,
+                },
+                line = process.stderr.recv(), if stderr_open => match line {
+                    Some(line) => eprintln!("{line}"),
+                    None => stderr_open = false,
+                },
+                status = &mut exit_rx, if exit.is_none() => {
+                    exit = Some(status.map_err(|_| {
+                        Error::Internal("guest browser exit channel closed".to_string())
+                    })??);
+                }
+            }
+            if exit.is_some() && !stdout_open && !stderr_open {
+                break;
+            }
+        }
+        Ok(())
+    })
+}
+
+fn run_browser_start(id: SandboxId, opts: BrowserStartOptions) -> Result<()> {
+    sdk_block_on(|sdk| async move {
+        // 1. Exec agent-sandbox-browser start in the guest (idempotent —
+        //    re-invocation on a running browser just re-prints status).
+        if !opts.skip_start {
+            let mut argv = vec![GUEST_BROWSER_BIN.to_string(), "start".to_string()];
+            argv.push(if opts.headed {
+                "--headed".into()
+            } else {
+                "--headless".into()
+            });
+            if let Some(p) = opts.cdp_port {
+                argv.push("--cdp-port".into());
+                argv.push(p.to_string());
+            }
+            if let Some(p) = opts.vnc_port {
+                argv.push("--vnc-port".into());
+                argv.push(p.to_string());
+            }
+            if let Some(profile) = &opts.profile {
+                argv.push("--profile".into());
+                argv.push(profile.clone());
+            }
+            let mut process = sdk.exec(&id, GuestCommand::new(argv)).await?;
+            // Drain the start command's output (it prints status= lines).
+            let mut exit_rx = process.exit;
+            let mut stdout_open = true;
+            let mut stderr_open = true;
+            let mut exit = None;
+            loop {
+                tokio::select! {
+                    line = process.stdout.recv(), if stdout_open => match line {
+                        Some(line) => println!("{line}"),
+                        None => stdout_open = false,
+                    },
+                    line = process.stderr.recv(), if stderr_open => match line {
+                        Some(line) => eprintln!("{line}"),
+                        None => stderr_open = false,
+                    },
+                    status = &mut exit_rx, if exit.is_none() => {
+                        exit = Some(status.map_err(|_| {
+                            Error::Internal("guest browser exit channel closed".to_string())
+                        })??);
+                    }
+                }
+                if exit.is_some() && !stdout_open && !stderr_open {
+                    break;
+                }
+            }
+        }
+
+        // 2. Forward the CDP port (and the VNC port if headed) to host
+        //    localhost ports. The forwards are SDK-owned and live as long
+        //    as this command does.
+        let cdp_port = opts.cdp_port.unwrap_or(9222);
+        let cdp_forward = sdk.forward_port(&id, cdp_port).await?;
+        println!("cdp_url=http://{}:{}", cdp_forward.host, cdp_forward.port);
+        let _vnc_forward = if opts.headed {
+            let vnc_port = opts.vnc_port.unwrap_or(5900);
+            let f = sdk.forward_port(&id, vnc_port).await?;
+            println!("vnc_url=vnc://{}:{}", f.host, f.port);
+            Some(f)
+        } else {
+            None
+        };
+
+        eprintln!(
+            "browser: forwarding cdp port; press Ctrl-C to stop browser and tear down forwards"
+        );
+
+        // 3. Wait for SIGINT, then stop browser + drop forwards (the SDK's
+        //    Drop tears down the host listener; the guest port-forwarder
+        //    process is killed via sdk.cancel_process inside the SDK's
+        //    teardown when stop_forwards is called).
+        tokio::signal::ctrl_c().await.map_err(Error::io)?;
+        eprintln!("browser: stopping...");
+        let _ = sdk.stop_forwards(&id).await;
+        let stop = sdk
+            .exec(
+                &id,
+                GuestCommand::new([GUEST_BROWSER_BIN.to_string(), "stop".to_string()]),
+            )
+            .await?;
+        let _ = stop.exit.await;
+        Ok(())
+    })
+}
+
+fn run_browser_view(id: SandboxId, opts: BrowserViewOptions) -> Result<()> {
+    // View = headed start + open local VNC client against the forwarded
+    // port. Reuses run_browser_start with headed=true plus an extra "open"
+    // step before the Ctrl-C wait — but to keep the shape simple we just
+    // call run_browser_start with headed and let the user open the VNC
+    // URL themselves, unless --no-open is unset and we can find a viewer.
+    let no_open = opts.no_open;
+    let macos_vnc_url_open = !no_open && cfg!(target_os = "macos");
+    let start_opts = BrowserStartOptions {
+        headed: true,
+        cdp_port: opts.cdp_port,
+        vnc_port: opts.vnc_port,
+        profile: opts.profile,
+        skip_start: false,
+    };
+    // The trick: print a hint after the URLs so the user can paste it,
+    // and on macOS try `open vnc://...` (the system uses Screen Sharing
+    // by default; falls back to whatever's bound to the vnc:// scheme).
+    if macos_vnc_url_open {
+        eprintln!("browser view: after the vnc_url= line appears, this will try `open <vnc_url>`");
+    }
+    run_browser_start(id, start_opts)
 }
 
 fn parse_fork_options(args: Vec<String>) -> Result<ForkOptions> {
@@ -787,6 +1047,10 @@ Usage:
                               [--cpus N] [--memory-mib N] [--memory-max-mib N]
                               [--memory-min-mib N] [--ephemeral]
   {program} fork SANDBOX_ID [--name NEW_ID] [--workspace PATH] [--no-credentials] [--ephemeral]
+  {program} browser start SANDBOX_ID [--headless|--headed] [--cdp-port N] [--vnc-port N] [--profile DIR]
+  {program} browser view SANDBOX_ID [--cdp-port N] [--vnc-port N] [--no-open]
+  {program} browser status SANDBOX_ID
+  {program} browser stop SANDBOX_ID
 
 Common options:
   --image PATH_OR_REF

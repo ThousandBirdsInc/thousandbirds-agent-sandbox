@@ -1,0 +1,231 @@
+#!/bin/sh
+# agent-sandbox-browser: launch / status / stop a Chromium session inside the
+# sandbox. Two modes:
+#
+#   headless (default): Chromium with --headless=new and the Chrome DevTools
+#     Protocol exposed on a local TCP port. The wrapper's port-forward
+#     mechanism (`tb-sandbox browser start`) maps that port to a host
+#     localhost port; the user's agent code drives the browser over CDP.
+#
+#   headed: Chromium under an Xvfb framebuffer plus an x11vnc server, so a
+#     human can view the session through a VNC client. The wrapper's
+#     `tb-sandbox browser view` forwards the VNC port and opens the user's
+#     local VNC client.
+#
+# This script is intentionally idempotent: invoking `start` while the browser
+# is already running is a successful no-op that re-prints the URL. `stop`
+# cleans up everything (Chromium, Xvfb, x11vnc) even if some of them are
+# already gone.
+#
+# Usage:
+#   agent-sandbox-browser start [--headless|--headed] [--cdp-port N] [--vnc-port N] [--profile DIR]
+#   agent-sandbox-browser status
+#   agent-sandbox-browser stop
+
+set -u
+
+PROFILE_BASE="${AGENT_SANDBOX_BROWSER_PROFILE:-/home/agent/.cache/agent-sandbox-browser}"
+STATE_DIR="${AGENT_SANDBOX_BROWSER_STATE:-/run/agent-sandbox-browser}"
+LOG_DIR="${AGENT_SANDBOX_BROWSER_LOG_DIR:-/var/log}"
+DEFAULT_CDP_PORT=9222
+DEFAULT_VNC_PORT=5900
+DEFAULT_DISPLAY=:99
+
+CHROMIUM_BIN="$(command -v chromium 2>/dev/null || command -v chromium-browser 2>/dev/null || true)"
+XVFB_BIN="$(command -v Xvfb 2>/dev/null || true)"
+X11VNC_BIN="$(command -v x11vnc 2>/dev/null || true)"
+WM_BIN="$(command -v fluxbox 2>/dev/null || command -v openbox 2>/dev/null || true)"
+
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+mkdir -p "$PROFILE_BASE" 2>/dev/null || true
+
+log() {
+  printf 'agent-sandbox-browser: %s\n' "$*" >&2
+}
+
+write_pid() {
+  printf '%s\n' "$2" > "$STATE_DIR/$1.pid"
+}
+
+read_pid() {
+  [ -f "$STATE_DIR/$1.pid" ] || return 1
+  cat "$STATE_DIR/$1.pid" 2>/dev/null
+}
+
+pid_alive() {
+  pid="$1"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+write_kv() {
+  # write_kv FILE KEY VALUE
+  printf '%s=%s\n' "$2" "$3" >> "$1"
+}
+
+cmd_status() {
+  cdp_pid=$(read_pid chromium || echo "")
+  vnc_pid=$(read_pid x11vnc || echo "")
+  xvfb_pid=$(read_pid xvfb || echo "")
+  cdp_port="$(cat "$STATE_DIR/cdp_port" 2>/dev/null || echo "")"
+  vnc_port="$(cat "$STATE_DIR/vnc_port" 2>/dev/null || echo "")"
+  mode="$(cat "$STATE_DIR/mode" 2>/dev/null || echo "")"
+  alive=0
+  pid_alive "$cdp_pid" && alive=1
+
+  if [ "$alive" -eq 1 ]; then
+    printf 'status=running\n'
+    printf 'mode=%s\n' "${mode:-headless}"
+    printf 'chromium_pid=%s\n' "$cdp_pid"
+    [ -n "$cdp_port" ] && printf 'cdp_port=%s\n' "$cdp_port"
+    [ -n "$cdp_port" ] && printf 'cdp_url=http://127.0.0.1:%s\n' "$cdp_port"
+    if [ "$mode" = "headed" ] && pid_alive "$vnc_pid"; then
+      printf 'vnc_pid=%s\n' "$vnc_pid"
+      [ -n "$vnc_port" ] && printf 'vnc_port=%s\n' "$vnc_port"
+    fi
+    return 0
+  fi
+  printf 'status=stopped\n'
+  # Reap stale pid files.
+  rm -f "$STATE_DIR/chromium.pid" "$STATE_DIR/x11vnc.pid" "$STATE_DIR/xvfb.pid" \
+        "$STATE_DIR/cdp_port" "$STATE_DIR/vnc_port" "$STATE_DIR/mode" 2>/dev/null || true
+  return 0
+}
+
+cmd_stop() {
+  for proc in chromium x11vnc xvfb; do
+    pid=$(read_pid "$proc" || echo "")
+    if pid_alive "$pid"; then
+      kill "$pid" 2>/dev/null || true
+      # Give it a moment to exit cleanly before SIGKILL.
+      i=0
+      while pid_alive "$pid" && [ $i -lt 20 ]; do
+        sleep 0.1
+        i=$((i + 1))
+      done
+      if pid_alive "$pid"; then
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+    fi
+    rm -f "$STATE_DIR/$proc.pid" 2>/dev/null || true
+  done
+  rm -f "$STATE_DIR/cdp_port" "$STATE_DIR/vnc_port" "$STATE_DIR/mode" 2>/dev/null || true
+  log "stopped"
+}
+
+cmd_start() {
+  if [ -z "$CHROMIUM_BIN" ]; then
+    log "chromium is not installed; rebuild the agent image with the debian-bookworm-browser variant"
+    exit 69
+  fi
+
+  mode="headless"
+  cdp_port="$DEFAULT_CDP_PORT"
+  vnc_port="$DEFAULT_VNC_PORT"
+  display="$DEFAULT_DISPLAY"
+  profile="$PROFILE_BASE/default"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --headless) mode="headless"; shift;;
+      --headed) mode="headed"; shift;;
+      --cdp-port)
+        cdp_port="${2:?--cdp-port requires a value}"; shift 2;;
+      --vnc-port)
+        vnc_port="${2:?--vnc-port requires a value}"; shift 2;;
+      --profile)
+        profile="${2:?--profile requires a value}"; shift 2;;
+      *) log "unknown argument: $1"; exit 64;;
+    esac
+  done
+
+  # Idempotency: if already running, just re-print the URL.
+  existing_pid=$(read_pid chromium || echo "")
+  if pid_alive "$existing_pid"; then
+    cmd_status
+    return 0
+  fi
+
+  mkdir -p "$profile" 2>/dev/null || true
+
+  # Common Chromium flags. --no-sandbox is acceptable because the entire VM
+  # is the sandbox boundary; the suid sandbox would fail anyway in a guest
+  # without the right capabilities. --disable-dev-shm-usage avoids the
+  # 64 MiB tmpfs limit Chromium hits in containerized environments.
+  chromium_args="--no-sandbox \
+    --disable-dev-shm-usage \
+    --disable-gpu \
+    --user-data-dir=$profile \
+    --remote-debugging-port=$cdp_port \
+    --remote-debugging-address=0.0.0.0 \
+    about:blank"
+
+  if [ "$mode" = "headed" ]; then
+    if [ -z "$XVFB_BIN" ] || [ -z "$X11VNC_BIN" ]; then
+      log "headed mode requires Xvfb and x11vnc; rebuild the browser image with display support"
+      exit 69
+    fi
+    "$XVFB_BIN" "$display" -screen 0 1280x800x24 >/dev/null 2>&1 &
+    xvfb_pid=$!
+    write_pid xvfb "$xvfb_pid"
+    # Wait briefly for the X server socket.
+    i=0
+    while [ ! -S "/tmp/.X11-unix/X${display#:}" ] && [ $i -lt 50 ]; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+
+    if [ -n "$WM_BIN" ]; then
+      DISPLAY="$display" "$WM_BIN" >/dev/null 2>&1 &
+    fi
+
+    # x11vnc serves the framebuffer on $vnc_port. -forever keeps it alive
+    # after the first client disconnects; -shared allows multiple viewers.
+    "$X11VNC_BIN" -display "$display" \
+      -rfbport "$vnc_port" -listen 0.0.0.0 \
+      -forever -shared -nopw -quiet >/dev/null 2>&1 &
+    vnc_pid=$!
+    write_pid x11vnc "$vnc_pid"
+
+    DISPLAY="$display" "$CHROMIUM_BIN" $chromium_args \
+      >"$LOG_DIR/agent-sandbox-browser.log" 2>&1 &
+    chromium_pid=$!
+  else
+    # Headless: --headless=new is Chromium's modern headless mode (Chrome
+    # 109+). It supports remote-debugging-port the same way as headed.
+    chromium_args="--headless=new $chromium_args"
+    # shellcheck disable=SC2086
+    "$CHROMIUM_BIN" $chromium_args \
+      >"$LOG_DIR/agent-sandbox-browser.log" 2>&1 &
+    chromium_pid=$!
+  fi
+
+  write_pid chromium "$chromium_pid"
+  printf '%s' "$cdp_port" > "$STATE_DIR/cdp_port"
+  printf '%s' "$vnc_port" > "$STATE_DIR/vnc_port"
+  printf '%s' "$mode" > "$STATE_DIR/mode"
+
+  # Give Chromium a moment to bind its CDP port. We don't probe the TCP
+  # listener here (POSIX sh has no portable way to do that without nc/curl
+  # in the image), but we verify the chromium process is still alive after
+  # the wait — Chromium startup failures (bad flags, port already in use,
+  # missing fonts) crash it within the first second.
+  i=0
+  while [ $i -lt 20 ]; do
+    if ! pid_alive "$chromium_pid"; then
+      log "chromium exited during startup; see $LOG_DIR/agent-sandbox-browser.log"
+      exit 1
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+
+  cmd_status
+}
+
+case "${1:-status}" in
+  start) shift; cmd_start "$@" ;;
+  stop) cmd_stop ;;
+  status) cmd_status ;;
+  *) log "unknown subcommand: ${1:-}"; exit 64 ;;
+esac

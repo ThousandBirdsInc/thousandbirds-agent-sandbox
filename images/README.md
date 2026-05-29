@@ -12,10 +12,14 @@ scripts/build-agent-image.sh debian-bookworm
 Optional variants:
 
 ```sh
+scripts/build-agent-image.sh debian-bookworm-browser
 scripts/build-agent-image.sh debian-bookworm-rust
 scripts/build-agent-image.sh debian-bookworm-go
 scripts/build-agent-image.sh ubuntu-noble
 ```
+
+The `debian-bookworm-browser` variant bakes Chromium into the libkrun image so
+browser sessions do not reinstall it per sandbox.
 
 The script builds an OCI image with Docker or Podman, overlays the guest shell
 scripts from `guest/`, then uses `../thousandbirds-libkrun/examples/os_mode_build_container_rootfs.py`

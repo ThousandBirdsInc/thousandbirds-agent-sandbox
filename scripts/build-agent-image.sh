@@ -12,7 +12,7 @@ IMAGE_PREFIX=${IMAGE_PREFIX:-tb-agent-sandbox}
 
 usage() {
   cat <<EOF
-Usage: $0 [debian-bookworm|debian-bookworm-rust|debian-bookworm-go|ubuntu-noble]
+Usage: $0 [debian-bookworm|debian-bookworm-browser|debian-bookworm-rust|debian-bookworm-go|ubuntu-noble]
 
 Environment:
   RUNTIME=docker|podman|auto      Container runtime for build/export (default: auto)
@@ -33,7 +33,7 @@ EOF
 }
 
 case "$VARIANT" in
-  debian-bookworm|debian-bookworm-rust|debian-bookworm-go|ubuntu-noble) ;;
+  debian-bookworm|debian-bookworm-browser|debian-bookworm-rust|debian-bookworm-go|ubuntu-noble) ;;
   -h|--help)
     usage
     exit 0
@@ -94,26 +94,26 @@ case "$PLATFORM" in
 esac
 
 build_image() {
-  containerfile=$1
+  build_containerfile=$1
   tag_name=$2
   allow_pull=${3:-1}
   if [ "${PULL:-0}" = "1" ] && [ "$allow_pull" = "1" ]; then
     "$runtime" build \
       --pull \
       --platform "$PLATFORM" \
-      -f "$containerfile" \
+      -f "$build_containerfile" \
       -t "$tag_name" \
       "$ROOT_DIR"
   else
     "$runtime" build \
       --platform "$PLATFORM" \
-      -f "$containerfile" \
+      -f "$build_containerfile" \
       -t "$tag_name" \
       "$ROOT_DIR"
   fi
 }
 
-if [ "$VARIANT" = "debian-bookworm-rust" ] || [ "$VARIANT" = "debian-bookworm-go" ]; then
+if [ "$VARIANT" = "debian-bookworm-browser" ] || [ "$VARIANT" = "debian-bookworm-rust" ] || [ "$VARIANT" = "debian-bookworm-go" ]; then
   build_image "$ROOT_DIR/images/debian-bookworm.Containerfile" "$IMAGE_PREFIX:debian-bookworm"
   build_pull=0
 else
@@ -136,6 +136,10 @@ mkdir -p \
 cp "$ROOT_DIR/guest/agent-sandbox-import-credentials" "$overlay_dir/root/usr/local/bin/"
 cp "$ROOT_DIR/guest/agent-sandbox-shell" "$overlay_dir/root/usr/local/bin/"
 cp "$ROOT_DIR/guest/agent-sandbox-quiesce" "$overlay_dir/root/usr/local/bin/"
+# Installed unconditionally; the script no-ops with a clear message if
+# chromium is not present (only the `debian-bookworm-browser` variant
+# bakes it in). Cheap to ship in every image.
+cp "$ROOT_DIR/guest/agent-sandbox-browser" "$overlay_dir/root/usr/local/bin/"
 sed "s|@SERIAL_TTY@|/dev/$console|g" \
   "$ROOT_DIR/guest/agent-sandbox-shell.service" \
   > "$overlay_dir/root/etc/systemd/system/agent-sandbox-shell.service"
@@ -153,7 +157,8 @@ ln -sf /dev/null \
 chmod 0755 \
   "$overlay_dir/root/usr/local/bin/agent-sandbox-import-credentials" \
   "$overlay_dir/root/usr/local/bin/agent-sandbox-shell" \
-  "$overlay_dir/root/usr/local/bin/agent-sandbox-quiesce"
+  "$overlay_dir/root/usr/local/bin/agent-sandbox-quiesce" \
+  "$overlay_dir/root/usr/local/bin/agent-sandbox-browser"
 chmod 0644 \
   "$overlay_dir/root/etc/systemd/system/agent-sandbox-shell.service" \
   "$overlay_dir/root/etc/systemd/system/agent-sandbox-quiesce.service"
@@ -217,6 +222,11 @@ else
   initramfs_json=''
 fi
 
+installed_tools_json='"git", "ripgrep", "node", "npm", "claude", "codex"'
+if [ "$VARIANT" = "debian-bookworm-browser" ]; then
+  installed_tools_json="$installed_tools_json, \"chromium\""
+fi
+
 cat > "$output_dir/image.json" <<EOF
 {
   "architecture": "$architecture",
@@ -231,7 +241,7 @@ $initramfs_json
   "init": "/sbin/init",
   "console": "$console",
   "guest_user": "agent",
-  "installed_tools": ["git", "ripgrep", "node", "npm", "claude", "codex"]
+  "installed_tools": [$installed_tools_json]
 }
 EOF
 

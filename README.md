@@ -613,6 +613,139 @@ cargo run -- shell \
   --ephemeral
 ```
 
+## Browser-In-Sandbox
+
+Agents can drive a real Chromium inside the sandbox over the Chrome DevTools
+Protocol (CDP). The browser variant of the image bakes in Chromium plus a
+display stack (`Xvfb` + `x11vnc` + `fluxbox`) so the same sandbox can serve
+both headless CDP automation and headed VNC viewing.
+
+Build the variant once:
+
+```sh
+BASE_BUNDLE=target/base-bundles/debian-systemd/libkrun-os-bundle \
+  scripts/build-agent-image.sh debian-bookworm-browser
+```
+
+Boot a sandbox from it:
+
+```sh
+cargo run -- create \
+  --image target/agent-images/debian-bookworm-browser \
+  --workspace . \
+  --name my-browser \
+  --memory-mib 4096
+```
+
+### Headless: drive Chromium over CDP
+
+Open the browser and forward the CDP port to the host. This command stays in
+the foreground holding the forward open; Ctrl-C stops the browser and tears
+the forward down.
+
+```sh
+cargo run -- start my-browser &       # boot the sandbox in another terminal first
+cargo run -- browser start my-browser
+# status=running
+# mode=headless
+# chromium_pid=341
+# cdp_port=9222
+# cdp_url=http://127.0.0.1:9222
+# cdp_url=http://127.0.0.1:54321
+# browser: forwarding cdp port; press Ctrl-C to stop browser and tear down forwards
+```
+
+The second `cdp_url=` line is the host-side forwarded URL — that is what the
+user's agent code connects to. A minimal end-to-end demo, in a separate
+terminal:
+
+```sh
+# Pretty-print the CDP target list — confirms the browser is reachable.
+curl -s http://127.0.0.1:54321/json/version | python3 -m json.tool
+
+# Drive it with the puppeteer Node client (or any CDP-compatible library):
+cat > /tmp/cdp-demo.mjs <<'EOF'
+import CDP from 'chrome-remote-interface';
+const client = await CDP({ port: 54321 });
+const { Page, Runtime } = client;
+await Page.enable();
+await Page.navigate({ url: 'https://example.com' });
+await Page.loadEventFired();
+const { result } = await Runtime.evaluate({ expression: 'document.title' });
+console.log('title:', result.value);
+await client.close();
+EOF
+npm install -g chrome-remote-interface 2>/dev/null
+node /tmp/cdp-demo.mjs
+# title: Example Domain
+```
+
+(Replace `54321` with whatever port the `browser start` output showed.)
+
+When you're done, `Ctrl-C` the `browser start` command. The wrapper runs
+`agent-sandbox-browser stop` in the guest and drops the host-side
+listener.
+
+### Headed: view the browser over VNC
+
+For visual debugging or demos, start in headed mode. This launches Xvfb +
+fluxbox + Chromium and an x11vnc server, then forwards both the CDP port
+and the VNC port to the host:
+
+```sh
+cargo run -- browser start my-browser --headed
+# status=running
+# mode=headed
+# chromium_pid=341
+# cdp_port=9222
+# vnc_port=5900
+# cdp_url=http://127.0.0.1:54321
+# vnc_url=vnc://127.0.0.1:54322
+```
+
+On macOS you can open the `vnc://` URL directly — Screen Sharing handles
+the `vnc://` scheme by default:
+
+```sh
+open vnc://127.0.0.1:54322
+```
+
+On Linux, point any VNC client at `127.0.0.1:54322`. `cargo run -- browser
+view my-browser` is a convenience wrapper that does headed-start + prints
+the same URLs (it does **not** auto-open a viewer; pipe the URL to your
+preferred client).
+
+### Inspect or stop without holding the forward
+
+`browser status` and `browser stop` are one-shot calls that don't stay
+attached:
+
+```sh
+cargo run -- browser status my-browser
+# status=running
+# mode=headless
+# chromium_pid=341
+# cdp_port=9222
+# cdp_url=http://127.0.0.1:9222
+
+cargo run -- browser stop my-browser
+# stopped
+```
+
+`status` reports the guest-side view; the `cdp_url` it prints uses the
+*guest* port (9222), not a forwarded host port — useful for sanity-checking
+that Chromium is alive even when no `browser start` is currently holding a
+forward.
+
+### Egress control
+
+The browser inherits whatever network configuration the sandbox was started
+with. With `--gvproxy` (or `--passt-socket`) the browser has full internet
+access; the host-side proxy's per-host header substitution rules (see the
+top of this README) apply to browser traffic too. Browser sessions are
+isolated per-VM the same way every other workload is — there is no shared
+profile or cookie jar across sandboxes.
+
 ## Resize Memory At Runtime
 
 A running sandbox can have its guest memory grown or shrunk live, without a
@@ -833,6 +966,8 @@ sh -n scripts/build-agent-image.sh
 sh -n scripts/profile-sandbox.sh
 sh -n guest/agent-sandbox-shell
 sh -n guest/agent-sandbox-import-credentials
+sh -n guest/agent-sandbox-quiesce
+sh -n guest/agent-sandbox-browser
 cc -Wall -Wextra -c guest/agent-sandbox-login-tty.c -o /tmp/agent-sandbox-login-tty.o
 cargo check
 ```
