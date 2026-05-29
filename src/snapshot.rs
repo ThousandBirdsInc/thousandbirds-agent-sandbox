@@ -79,27 +79,40 @@ impl std::fmt::Display for SnapshotId {
     }
 }
 
-/// What a snapshot captures. Open enum on disk so a future `"full"` kind that
-/// also captures memory + vCPU state can land without breaking restore of
-/// existing artifacts.
+/// What a snapshot captures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotKind {
     /// Root disk + sandbox configuration. No memory, no live processes.
+    /// Restore cold-boots from the snapshotted disk.
     DiskOnly,
+    /// Root disk + sandbox configuration + guest memory image + vCPU + GIC
+    /// + device state. Restore resumes from the captured execution point.
+    ///
+    /// **Producing a `Full` snapshot needs a libkrun build with the
+    /// snapshot/restore API landed** (see Phase 3 of
+    /// `docs/closing-the-smolvm-gap-plan.md` and the matching libkrun
+    /// design doc `thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md`).
+    /// `SandboxManager::snapshot` recognizes the kind and surfaces a typed
+    /// error when libkrun does not yet support it, so callers can write
+    /// against the surface today and pick up real memory capture as soon
+    /// as the libkrun-side work lands without a wrapper-side change.
+    Full,
 }
 
 impl SnapshotKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::DiskOnly => "disk-only",
+            Self::Full => "full",
         }
     }
 
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "disk-only" => Ok(Self::DiskOnly),
+            "full" => Ok(Self::Full),
             other => Err(Error::InvalidArgument(format!(
-                "unsupported snapshot kind {other}; this build only understands disk-only"
+                "unsupported snapshot kind {other}; this build understands disk-only and full"
             ))),
         }
     }
@@ -145,6 +158,12 @@ pub struct SnapshotManifest {
     /// When the guest acknowledged quiescence, in unix milliseconds. `None`
     /// when `quiesced` is false.
     pub quiesced_unix_millis: Option<u128>,
+
+    /// Path (relative to the snapshot directory) of the captured guest
+    /// memory image when `kind == Full`. `None` for `DiskOnly` snapshots.
+    /// Today's wrapper does not produce these — Phase 3 of the gap plan
+    /// covers the libkrun-side capture work that will populate it.
+    pub memory_image_path: Option<PathBuf>,
 }
 
 impl SnapshotManifest {
@@ -197,7 +216,8 @@ impl SnapshotManifest {
                 "  \"quiesced\": {quiesced},\n",
                 "  \"quiesce_action\": \"{quiesce_action}\",\n",
                 "  \"quiesced_unix_millis\": {quiesced_unix_millis},\n",
-                "  \"note\": \"disk-only snapshot; guest memory and live processes are not preserved\"\n",
+                "  \"memory_image_path\": \"{memory_image_path}\",\n",
+                "  \"note\": \"{note}\"\n",
                 "}}\n"
             ),
             version = self.version,
@@ -220,6 +240,19 @@ impl SnapshotManifest {
             quiesced = self.quiesced,
             quiesce_action = escape_json(self.quiesce_action.as_deref().unwrap_or("")),
             quiesced_unix_millis = self.quiesced_unix_millis.unwrap_or(0),
+            memory_image_path = escape_json(
+                &self
+                    .memory_image_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            ),
+            note = match self.kind {
+                SnapshotKind::DiskOnly =>
+                    "disk-only snapshot; guest memory and live processes are not preserved",
+                SnapshotKind::Full =>
+                    "full snapshot; includes captured guest memory and vCPU state",
+            },
         )
     }
 
@@ -275,6 +308,13 @@ impl SnapshotManifest {
                     Some(v as u128)
                 }
             }),
+            memory_image_path: json_string(json, "memory_image_path").and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(s))
+                }
+            }),
         })
     }
 }
@@ -315,6 +355,17 @@ pub struct SnapshotOptions {
     pub quiesce_timeout: Option<Duration>,
     /// Use `fsfreeze -f /` when quiescing. Set to `false` for `sync`-only.
     pub quiesce_freeze: bool,
+    /// Also capture guest memory + vCPU + device state, producing a
+    /// `SnapshotKind::Full` artifact whose restore resumes from the
+    /// captured execution point rather than cold-booting from the disk.
+    ///
+    /// Requires a libkrun build with the snapshot/restore API landed
+    /// (Phase 3 of `docs/closing-the-smolvm-gap-plan.md`). Until that
+    /// work ships, `SandboxManager::snapshot` returns a typed error
+    /// pointing at the gap plan. Callers can wire `capture_memory: true`
+    /// into their code today; it will start working as soon as the
+    /// libkrun side lands without a wrapper-side change.
+    pub capture_memory: bool,
 }
 
 impl Default for SnapshotOptions {
@@ -324,6 +375,7 @@ impl Default for SnapshotOptions {
             skip_quiesce: false,
             quiesce_timeout: None,
             quiesce_freeze: true,
+            capture_memory: false,
         }
     }
 }
@@ -533,6 +585,7 @@ mod tests {
             quiesced: true,
             quiesce_action: Some("freeze".to_string()),
             quiesced_unix_millis: Some(1_700_000_001_500),
+            memory_image_path: None,
         }
     }
 
@@ -587,6 +640,33 @@ mod tests {
     }
 
     #[test]
+    fn manifest_round_trip_full_kind_with_memory_image() {
+        // Forward-compat: a Phase-3 Full snapshot's manifest round-trips
+        // through the same parser used by Phase-1 disk-only manifests.
+        let mut original = sample_manifest();
+        original.kind = SnapshotKind::Full;
+        original.memory_image_path = Some(PathBuf::from("memory.bin"));
+        let json = original.to_json();
+        assert!(json.contains("\"kind\": \"full\""));
+        assert!(json.contains("\"memory_image_path\": \"memory.bin\""));
+        let parsed = SnapshotManifest::from_json(&json).unwrap();
+        assert_eq!(parsed.kind, SnapshotKind::Full);
+        assert_eq!(
+            parsed.memory_image_path.as_deref(),
+            Some(PathBuf::from("memory.bin").as_path())
+        );
+    }
+
+    #[test]
+    fn snapshot_kind_full_parses() {
+        assert_eq!(SnapshotKind::parse("full").unwrap(), SnapshotKind::Full);
+        assert_eq!(
+            SnapshotKind::parse("disk-only").unwrap(),
+            SnapshotKind::DiskOnly
+        );
+    }
+
+    #[test]
     fn snapshot_id_rejects_invalid_characters() {
         assert!(SnapshotId::new("ok-1").is_ok());
         assert!(SnapshotId::new("with space").is_err());
@@ -596,10 +676,13 @@ mod tests {
 
     #[test]
     fn unknown_kind_fails_fast() {
+        // A future "incremental" or similar kind must fail-fast rather than
+        // silently degrading to disk-only or full.
         let mut json = sample_manifest().to_json();
-        json = json.replace("\"disk-only\"", "\"full\"");
+        json = json.replace("\"disk-only\"", "\"incremental-v2\"");
         let err = SnapshotManifest::from_json(&json).unwrap_err();
-        assert!(err.to_string().contains("disk-only"));
+        let msg = err.to_string();
+        assert!(msg.contains("disk-only") && msg.contains("full"));
     }
 
     #[test]

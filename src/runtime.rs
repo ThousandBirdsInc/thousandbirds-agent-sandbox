@@ -385,6 +385,10 @@ impl SandboxManager {
             runtime_control_mount: &stored.runtime_control,
             network_backend: &launch_network_backend,
             log_level: stored.log_level,
+            // Phase 3 plumbing — populated by a future
+            // SandboxManager::restore_with_memory once libkrun lands
+            // --restore. Cold-boot paths leave it None.
+            restore_from: None,
         })?;
         command
             .stdin(Stdio::inherit())
@@ -467,6 +471,10 @@ impl SandboxManager {
             runtime_control_mount: &stored.runtime_control,
             network_backend: &launch_network_backend,
             log_level: stored.log_level,
+            // Phase 3 plumbing — populated by a future
+            // SandboxManager::restore_with_memory once libkrun lands
+            // --restore. Cold-boot paths leave it None.
+            restore_from: None,
         })?;
         command
             .stdin(Stdio::null())
@@ -653,6 +661,23 @@ impl SandboxManager {
     /// replays on next boot, but in-flight application writes can be torn.
     pub fn snapshot(&self, id: &SandboxId, opts: SnapshotOptions) -> Result<SnapshotId> {
         let stored = self.load(id)?;
+        // Phase 3 surface check. SnapshotOptions accepts capture_memory: true
+        // today so callers can write against the eventual API, but until the
+        // libkrun-side capture path lands (see
+        // docs/closing-the-smolvm-gap-plan.md Phase 3 and the matching
+        // thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md)
+        // we cannot honor it. Surface a typed error here rather than silently
+        // producing a disk-only snapshot — the caller would otherwise believe
+        // memory was captured.
+        if opts.capture_memory {
+            return Err(Error::InvalidArgument(format!(
+                "snapshot of sandbox {id} requested capture_memory=true, but this \
+                 libkrun build does not yet support memory + vCPU capture. The \
+                 Rust surface accepts the option so callers can integrate today; \
+                 disk-only snapshots work with capture_memory=false. Tracking: \
+                 docs/closing-the-smolvm-gap-plan.md Phase 3."
+            )));
+        }
         let snap_id = match opts.name {
             Some(name) => SnapshotId::new(sanitize_id(&name))?,
             None => SnapshotId::new(format!("snapshot-{}", unix_millis()))?,
@@ -735,6 +760,10 @@ impl SandboxManager {
                     None
                 },
                 quiesced_unix_millis: achieved_unix_millis,
+                // Phase 3 (memory capture) lands this as Some(path) when
+                // the libkrun side ships. Today's disk-only path leaves it
+                // None; the manifest's `kind` stays `disk-only`.
+                memory_image_path: None,
             };
             let manifest_path = snap_dir.join("manifest.json");
             fs::write(&manifest_path, manifest.to_json())
@@ -2422,6 +2451,42 @@ mod tests {
         .unwrap();
         assert!(!manifest.quiesced);
         assert_eq!(manifest.quiesce_action, None);
+    }
+
+    // -- Phase 3 surface (memory snapshot) -----------------------------------
+
+    #[test]
+    fn snapshot_with_capture_memory_returns_typed_error_today() {
+        // Phase 3 forward-compat: callers can set capture_memory=true now;
+        // the wrapper surfaces a clean error pointing at the gap plan
+        // rather than silently downgrading to a disk-only snapshot.
+        let (manager, image) = snapshot_fixture("capture-memory-unimplemented");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        let sandbox = manager.create(config).unwrap();
+
+        let err = manager
+            .snapshot(
+                &sandbox.id,
+                SnapshotOptions {
+                    capture_memory: true,
+                    ..Default::default()
+                },
+            )
+            .expect_err("capture_memory should surface unimplemented today");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("capture_memory") && msg.contains("Phase 3"),
+            "got: {msg}"
+        );
+        // No snapshot artifact was created.
+        let snapshots_dir = manager.state_root.join("snapshots");
+        if snapshots_dir.exists() {
+            assert!(
+                fs::read_dir(&snapshots_dir).unwrap().next().is_none(),
+                "no snapshot dirs should be left behind on error"
+            );
+        }
     }
 
     #[test]

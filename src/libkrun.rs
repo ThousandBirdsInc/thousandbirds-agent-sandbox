@@ -30,6 +30,18 @@ pub struct LaunchConfig<'a> {
     pub runtime_control_mount: &'a Path,
     pub network_backend: &'a NetworkBackend,
     pub log_level: LogLevel,
+    /// Path to a snapshot directory to restore from (gap plan Phase 3). When
+    /// `Some`, the launcher receives `--restore PATH` and is expected to
+    /// rebuild the VM's memory + vCPU + device state from that snapshot
+    /// rather than cold-booting from the kernel/initramfs/root disk.
+    ///
+    /// Today no production caller sets this — the `--restore` flag is added
+    /// by Phase D of the libkrun-side
+    /// `thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md`
+    /// plan. The wrapper plumbing is in place so that when libkrun lands the
+    /// flag, integrating it here is a single `SandboxManager::restore`
+    /// branch and no `LaunchConfig` shape change.
+    pub restore_from: Option<&'a Path>,
 }
 
 pub fn launch(config: LaunchConfig<'_>) -> Result<ExitStatus> {
@@ -63,6 +75,30 @@ fn launch_command_with_launcher(config: LaunchConfig<'_>, launcher: &Path) -> Re
             prepend_env_path("DYLD_LIBRARY_PATH", &dylib_path),
         );
     }
+
+    // Phase 3 (memory snapshot restore) path. When `restore_from` is set we
+    // pass `--restore PATH` and the matching `--root-disk` (libkrun's
+    // restore wires the disk into the restored virtio-blk). The kernel /
+    // initramfs / boot config args become inert under restore so we omit
+    // them — this keeps the os_mode launcher's mutually-exclusive arg
+    // contract clean once it lands the flag.
+    if let Some(snapshot_path) = config.restore_from {
+        command
+            .arg("--restore")
+            .arg(snapshot_path)
+            .arg("--cpus")
+            .arg(config.cpus.to_string())
+            .arg("--memory-mib")
+            .arg(config.memory_max_mib.max(config.memory_mib).to_string())
+            .arg("--serial-pty")
+            .arg("--root-disk")
+            .arg(config.root_disk)
+            .arg("--console")
+            .arg(&config.image.console);
+        append_common_launcher_args(&mut command, &config)?;
+        return Ok(command);
+    }
+
     command
         .arg("--kernel")
         .arg(&config.image.kernel)
@@ -89,6 +125,25 @@ fn launch_command_with_launcher(config: LaunchConfig<'_>, launcher: &Path) -> Re
     if let Some(initramfs) = &config.image.initramfs {
         command.arg("--initramfs").arg(initramfs);
     }
+    if !config.image.root_options.is_empty() {
+        command
+            .arg("--root-options")
+            .arg(&config.image.root_options);
+    }
+    command
+        .arg("--kernel-cmdline")
+        .arg(shell_kernel_cmdline(config.image.kernel_cmdline.as_deref()));
+
+    append_common_launcher_args(&mut command, &config)?;
+
+    Ok(command)
+}
+
+/// Append the launcher arguments that are common to both the cold-boot path
+/// and the restore path: balloon control socket (for runtime memory resize),
+/// virtio-fs DAX window, network backend, all virtio-fs mounts (workspace,
+/// agent-config, agent-control, credentials), and the log-level note.
+fn append_common_launcher_args(command: &mut Command, config: &LaunchConfig<'_>) -> Result<()> {
     // Enable runtime memory resizing only when a control socket is provided and
     // there is headroom (ceiling > initial) for the balloon to grow into.
     if let Some(control_socket) = config.control_socket {
@@ -101,11 +156,6 @@ fn launch_command_with_launcher(config: LaunchConfig<'_>, launcher: &Path) -> Re
                 .arg("--control-socket")
                 .arg(control_socket);
         }
-    }
-    if !config.image.root_options.is_empty() {
-        command
-            .arg("--root-options")
-            .arg(&config.image.root_options);
     }
     // Open a virtio-fs DAX window so shared read-only mounts are served from the
     // host page cache (shared across VMs) instead of copied per-guest.
@@ -131,9 +181,6 @@ fn launch_command_with_launcher(config: LaunchConfig<'_>, launcher: &Path) -> Re
             ));
         }
     }
-    command
-        .arg("--kernel-cmdline")
-        .arg(shell_kernel_cmdline(config.image.kernel_cmdline.as_deref()));
 
     for mount in config.workspace_mounts {
         command.arg(if mount.read_only {
@@ -163,7 +210,7 @@ fn launch_command_with_launcher(config: LaunchConfig<'_>, launcher: &Path) -> Re
             config.log_level
         );
     }
-    Ok(command)
+    Ok(())
 }
 
 fn shell_kernel_cmdline(image_cmdline: Option<&str>) -> String {

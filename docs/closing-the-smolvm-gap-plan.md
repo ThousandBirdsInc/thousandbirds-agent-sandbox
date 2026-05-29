@@ -329,12 +329,51 @@ or a wedged guest. Failure modes are covered by tests:
 mode (and its on-VM checksum-while-writing test from the original exit
 criteria) remains the small follow-on.
 
-#### Phase 3 — HVF memory + vCPU + device capture [krun-heavy]
+#### Phase 3 — HVF memory + vCPU + device capture [krun-heavy] — SCAFFOLDED (libkrun core impl pending)
 
 Goal: a real snapshot. This is the work
 `thousandbirds-libkrun/design_docs/snapshot_restore.md` audits but does not
 schedule. Order intentionally matches that audit's "HVF first" recommendation
 since macOS is the hard host requirement.
+
+What landed (wrapper-side + libkrun-side planning):
+
+- **`thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md`**
+  (new): turns the existing audit into a scheduled, file-pathed implementation
+  plan. Five phases (A foundations → B KVM x86_64 capture → C HVF aarch64
+  capture → D public C API + os_mode → E dedup), each independently mergeable
+  with explicit exit criteria. C is sub-phased C.1–C.5 because GICv3 capture
+  is the largest chunk and deserves its own review unit.
+- **`SnapshotKind::Full` variant** in `src/snapshot.rs` (this repo). The on-disk
+  manifest now encodes either `"disk-only"` (Phase 1) or `"full"` (Phase 3
+  destination). A future `"incremental-v2"` or similar fails fast rather than
+  silently degrading.
+- **`SnapshotManifest::memory_image_path`** — `Option<PathBuf>`, populated by
+  the future Full-kind path with a path relative to the snapshot directory.
+  `None` for disk-only.
+- **`SnapshotOptions::capture_memory`** — callers can write `capture_memory:
+  true` *today*. `SandboxManager::snapshot` recognizes it and returns a typed
+  `Error::InvalidArgument` pointing at this section + the libkrun design doc,
+  rather than silently producing a disk-only snapshot. The error message names
+  the specific gap so users see what's blocking, and integration code does not
+  need to change once libkrun lands the capture path.
+- **`LaunchConfig::restore_from`** in `src/libkrun.rs` — `Option<&Path>`. When
+  `Some`, the launcher invocation emits `--restore PATH`, skips the
+  kernel/initramfs/root-options/kernel-cmdline block (mutually exclusive with
+  restore per the libkrun design doc Phase D contract), keeps the common
+  tail (DAX, network backend, virtio-fs mounts) via the new
+  `append_common_launcher_args` helper. Today no production caller sets it
+  because the os_mode launcher does not yet understand `--restore`; the
+  wrapper plumbing is in place so wiring it up after libkrun ships Phase D is
+  a single branch in `SandboxManager::restore` rather than a shape change.
+- **3 new tests** (`runtime::tests::snapshot_with_capture_memory_returns_typed_error_today`,
+  `snapshot::tests::manifest_round_trip_full_kind_with_memory_image`,
+  `snapshot::tests::snapshot_kind_full_parses`). The pre-existing
+  `unknown_kind_fails_fast` test was tightened to use `"incremental-v2"` as
+  its synthetic-bad value now that `"full"` is real.
+
+The original sub-phase plan (kept here as a check-list for the libkrun-side
+work):
 
 Concrete libkrun changes (in dependency order):
 
@@ -399,6 +438,25 @@ snapshot point not from zero, (d) MAC address has changed, (e) wall-clock has
 advanced (no time stall observable to a userspace clock). Wall-clock restore
 time on the macOS dev machine is < 200 ms for a 2048 MiB VM with a 256 MiB
 working set (sparse memory image, mmap restore).
+
+**What remains for full Phase 3:** the libkrun-side capture path itself.
+The implementation plan in
+[`thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md`](../../thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md)
+breaks this into Phases A–D with effort estimates (~3–5 days, 2 weeks,
+4–6 weeks, 1 week respectively) totaling 7–9 weeks of focused work. None
+of it is wrapper-side. Once Phase D lands, integration on this side is:
+
+1. Add `SandboxManager::restore_with_memory(snap_id, opts) -> Result<Sandbox>`
+   that recognizes `manifest.kind == Full`, populates `LaunchConfig::restore_from`
+   in the new sandbox's launch path, and skips the cold-boot disk re-clone (the
+   snapshot's memory image is paired with the cloned disk at restore time).
+2. Flip `SandboxManager::snapshot`'s `capture_memory: true` branch from
+   "return typed error" to "send a snapshot-memory RPC over the existing
+   control socket and capture the response path into `manifest.memory_image_path`".
+
+Each is a small, focused change against a stable libkrun ABI — the whole
+point of the Phase 3 scaffolding that landed in this commit is to make
+those changes minimal and obvious when the libkrun-side work is done.
 
 #### Phase 4 — Memory dedup (optional follow-on) [krun]
 
@@ -568,7 +626,8 @@ Original plan, calendar order if one engineer works end-to-end:
 4. **G3 browser image + VNC viewer** — 2–3 weeks. Independent of G1
    Phases 3/4, can interleave.
 5. **G1 Phase 3 (HVF capture/restore)** — 6–10 weeks. The hard one. Owns
-   most of the calendar.
+   most of the calendar. **WRAPPER-SIDE SCAFFOLDING DONE; libkrun-side core
+   implementation (Phases A–D of the libkrun design doc) pending.**
 6. **G1 Phase 4 (dedup)** — deferred.
 
 Remaining critical path is **Phase 3 (HVF memory/vCPU/device capture)** —
