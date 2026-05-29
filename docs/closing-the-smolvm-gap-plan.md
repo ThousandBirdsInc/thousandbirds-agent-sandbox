@@ -14,81 +14,104 @@ public APIs.
 
 ## Status (as of the last commit on `main`)
 
-The bulk of the planned work has shipped across both repos. The table below
-is the at-a-glance state; per-gap sections further down still document the
-full design intent and the remaining sub-items.
-
 | Gap | Status | Commit(s) |
 |---|---|---|
 | **G1 Phase 1** disk-state snapshot/restore + VM forking | ✅ DONE | wrapper `6ec6f9a` |
-| **G1 Phase 2** cooperative quiesce (sync-mode) | ✅ DONE | wrapper `19e7ebf` |
-| **G1 Phase 3** memory + vCPU + GICv3 + device capture/restore | ✅ CODE COMPLETE | libkrun `69fc1cd`→`ec9c5d8`, wrapper `d59c83a`→`d2a46fd` |
+| **G1 Phase 2** cooperative quiesce (sync + strict freeze) | ✅ DONE | wrapper `19e7ebf`, strict-freeze `1f579d5` |
+| **G1 Phase 3** memory + vCPU + GICv3 + device capture/restore | ✅ CODE COMPLETE | libkrun `69fc1cd`→`ec9c5d8`, wrapper `d59c83a`→`d2a46fd`, GICv3 extension libkrun `11cd744` |
 | **G3** browser-in-sandbox (Chromium + CDP + VNC) | ✅ DONE | wrapper `98dc854` |
-| **G1** Phase 2 strict-freeze in quiesce daemon | ✅ DONE | this commit |
-| **G1** HVF GICv3 extended capture set | ✅ DONE | this commit |
-| **Egress allowlist** in proxy (SmolVM `allowed_domains` equiv.) | ✅ DONE | this commit |
-| **G4** packaging + framework adapters (Python/TS shims, OpenAI Agents/LangChain/PydanticAI adapters, daemon, pipx/brew installers) | ⛔ OUT OF SCOPE — explicitly deferred (see note below) | — |
+| **Egress allowlist** in proxy (SmolVM `allowed_domains` equiv.) | ✅ DONE | wrapper `1f579d5` |
+| **G4** packaging + framework adapters | ⛔ OUT OF SCOPE (Rust SDK is the canonical embedder surface) | — |
 | **G2** Windows guests | ⛔ DECLINED (would require abandoning HVF-direct libkrun) | — |
 | **G5** cross-host snapshot portability | ⛔ DECLINED (per libkrun snapshot contract) | — |
 
-**Note on G4:** The original plan flagged G4 packaging as the highest-leverage
-item for external adoption. It is genuinely shippable code — `tb-sandbox-daemon`
-JSON-RPC + Python/TS packages + thin framework adapters — but it is explicitly
-out of scope for this project. External adoption surface is handled separately
-when/if that becomes a goal. The Rust SDK (`SandboxManagerSdk`) remains the
-canonical embedder surface and is already documented.
-
-Tests across both repos: 62 wrapper + 35 libkrun = 97 passing, 0 failing.
+Tests across both repos: **102 passing, 0 failing** (67 wrapper + 35 libkrun).
 
 ## Remaining Work
 
-What's left after this session is **only hardware-bound verification and
-optional polish**. No more code-design gaps.
+**There are no remaining code-design gaps.** Every code item from the
+original plan has shipped on `main` or is explicitly out of scope. What
+follows is grouped by what's actually needed to make progress on it.
 
-### 1. G1 — end-to-end verification on real guests [hardware-bound, ~½ day each]
+### A. Needs nothing — pure code, doable on any machine
 
-The Phase 3 code is wired end-to-end across both repos, but the actual
-round-trip has not been booted in this environment (no os_mode_artifacts
-bundle on this dev machine, no `/dev/kvm` for the Linux path):
+These items are well-scoped Rust changes with no hardware prerequisite.
+They land on `main` the same way every other commit this session has.
 
-- **HVF aarch64 round-trip:** boot an os_mode Debian guest with the
-  browser variant, write a memory marker pattern + a file, send
-  `snapshot-memory PATH` over the control socket, exit, restore from
-  that path, verify the marker pattern and file content survive,
-  verify `uptime` resumes from snapshot point not zero.
-- **KVM x86_64 round-trip** on a Linux host with `/dev/kvm`.
-- **Phase 2 strict-freeze round-trip** — the daemon now implements true
-  `fsfreeze -f /` (caches fsfreeze in tmpfs, uses bash builtins for
-  sleep/time during the frozen window). Needs a real Linux guest to
-  verify the libc-page-cache-eviction caveat in the daemon comments is
-  benign in practice.
-
-Both round-trip verifications are bounded test gaps against complete code
-paths.
-
-### 2. G1 — bounded follow-ons (snapshot polish, optional)
-
-- **Per-virtio-device save_state/restore_state** on the virtio device
+- **Per-virtio-device `save_state`/`restore_state`** on the virtio device
   trait in libkrun (virtio-blk, virtio-net, virtio-fs, balloon, mmio
-  transport). The current snapshot captures vCPU + GIC + memory but not
-  in-flight virtio request state. Wrapper-level cooperative quiesce
-  (sync + drain, plus strict freeze when available) makes this safe in
-  practice for the agent workloads this repo targets; persistent virtio
-  queue state is needed only if snapshots are taken without quiesce
-  (~1–2 weeks for full coverage).
-- **Extending HVF_GIC_DISTRIBUTOR_REG_IDS** further. The capture set
-  shipped this session covers GICD_CTLR plus the first 1024 interrupt
-  IDs across IGROUPR/ISENABLER/ICENABLER/IPRIORITYR/ICFGR + 32 IROUTER
-  SPI affinity entries. Workloads using more than that need extending
-  the list (mechanical, but pending real evidence it matters).
-- **G1 Phase 4** content-addressed memory chunk dedup. Deferred per the
-  original plan; only worth doing once Phase 3 is in production use.
+  transport). The Phase 3 snapshot captures vCPU + GIC + memory but not
+  in-flight virtio request state. Wrapper-level quiesce (sync + drain,
+  plus strict freeze) makes this safe for the agent workloads we target;
+  full device-state serialization is needed only if snapshots are taken
+  without quiesce. **Effort: ~1–2 weeks.** Not required for any current
+  workload; ship-when-needed.
+- **Extending `HVF_GIC_DISTRIBUTOR_REG_IDS` further.** The 176-register
+  set on `main` covers the first 1024 interrupt IDs across CTLR + the
+  per-bank registers. Workloads with more SPIs need the list extended
+  (mechanical). **Effort: minutes per added range.** Pending evidence
+  that any real workload needs more.
+- **G1 Phase 4** content-addressed memory-chunk dedup for restored
+  siblings. Deferred per the original plan; only worth building once
+  Phase 3 is in production use. **Effort: ~1–2 weeks.**
+
+### B. Needs the macOS dev machine + a libkrun `os_mode_artifacts` bundle
+
+These are **verification** steps, not implementation work. The macOS host
+is what the project already targets; what's missing is a bootable
+`os_mode_artifacts` bundle (kernel + initramfs + root disk + image
+manifest) on this specific dev machine. A bundle is produced by
+`thousandbirds-libkrun/examples/os_mode_build_container_rootfs.py` plus
+Docker/Podman to build the rootfs container — once per image variant.
+
+- **HVF aarch64 Phase 3 round-trip.** Boot an os_mode Debian guest
+  (built with `scripts/build-agent-image.sh debian-bookworm-browser`),
+  write a memory marker pattern + a file, send `snapshot-memory PATH`
+  over the runtime control socket, exit the VM, restore from `PATH`,
+  verify (a) the file content survives, (b) the memory pattern is
+  intact, (c) `uptime` resumes from snapshot point not zero, (d) MAC
+  has been refreshed. **Effort: ~½ day** once a bundle exists.
+- **Strict-freeze round-trip.** Same HVF guest setup. The daemon now
+  implements true `fsfreeze -f /` with cached binaries in tmpfs and
+  bash-builtin sleep during the frozen window. Verify (a) the freeze
+  takes hold (`stat /` from a parallel host context blocks during the
+  window), (b) unfreeze completes cleanly, (c) the libc-page-cache-
+  eviction caveat in `guest/agent-sandbox-quiesce` comments is benign
+  in practice on a memory-light guest. **Effort: ~half a day** once a
+  bundle exists.
+
+Both of these can be run by the user today on the existing Mac as soon
+as a bundle is built — no second machine needed.
+
+### C. Needs a Linux host with `/dev/kvm`
+
+The one item that genuinely requires a Linux host (or a Linux VM with
+nested virt). This dev machine is macOS; the verification has to happen
+elsewhere — on a Linux laptop, a Linux server, or a CI runner.
+
+- **KVM x86_64 Phase 3 round-trip.** Same shape as the HVF round-trip:
+  boot an os_mode guest, write a marker, snapshot via the control
+  socket, exit, restore, verify. The Linux KVM `save_state`/`restore_state`
+  path in `src/vmm/src/linux/vstate.rs` was already present in upstream
+  libkrun before this session and was promoted to the public
+  `SnapshotableVm`/`SnapshotableVcpu` traits in `e129032`; this
+  verification confirms the promoted path round-trips correctly with
+  the Phase D orchestration. **Effort: ~½ day** on a Linux host with
+  `/dev/kvm` and a Linux/x86_64 os_mode bundle.
+
+This is the **only** item on the entire remaining list that strictly
+requires a Linux host. Skipping it is fine if the project does not need
+to ship KVM x86_64 as a supported target — HVF aarch64 on macOS (item B)
+exercises the same Phase 3 codepaths through a different backend, so
+"snapshot/restore works" can be evidenced without ever running the KVM
+path.
 
 ## Explicitly out of scope
 
 - **G4 packaging + framework adapters** — `tb-sandbox-daemon` JSON-RPC
   + Python/TS shims + OpenAI Agents/LangChain/PydanticAI adapters +
-  pipx/brew installers. Useful work, but the project is keeping its
+  pipx/brew installers. Genuinely shippable code (~1–2 weeks per the
+  original design section below), but the project is keeping its
   surface area focused on the Rust SDK; external-language adoption is
   not a goal right now. The Rust `SandboxManagerSdk` remains the
   canonical embedder surface.
