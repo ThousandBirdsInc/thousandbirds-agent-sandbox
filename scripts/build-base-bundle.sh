@@ -103,7 +103,9 @@ case "$PLATFORM" in
   linux/amd64)
     kernel_format=1
     architecture=x86_64
-    console=ttyS0
+    # libkrun on x86_64 exposes a virtio-console (hvc0), not an 8250 ttyS0; the
+    # console name also picks the guest agent-shell's serial tty (/dev/$console).
+    console=hvc0
     ;;
   *)
     echo "unsupported PLATFORM=$PLATFORM" >&2

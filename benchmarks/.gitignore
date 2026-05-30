@@ -1,0 +1,4 @@
+# Benchmark output and provider scratch state.
+results/
+__pycache__/
+*.pyc

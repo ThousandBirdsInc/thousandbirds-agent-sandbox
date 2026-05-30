@@ -90,7 +90,7 @@ fn launch_command_with_launcher(config: LaunchConfig<'_>, launcher: &Path) -> Re
             .arg(config.cpus.to_string())
             .arg("--memory-mib")
             .arg(config.memory_max_mib.max(config.memory_mib).to_string())
-            .arg("--serial-pty")
+            .args(serial_pty_args())
             .arg("--root-disk")
             .arg(config.root_disk)
             .arg("--console")
@@ -110,7 +110,7 @@ fn launch_command_with_launcher(config: LaunchConfig<'_>, launcher: &Path) -> Re
         // the initial size when resizing is enabled.
         .arg("--memory-mib")
         .arg(config.memory_max_mib.max(config.memory_mib).to_string())
-        .arg("--serial-pty")
+        .args(serial_pty_args())
         .arg("--root-disk")
         .arg(config.root_disk)
         .arg("--root-device")
@@ -211,6 +211,19 @@ fn append_common_launcher_args(command: &mut Command, config: &LaunchConfig<'_>)
         );
     }
     Ok(())
+}
+
+/// libkrun exposes a PTY-backed serial console only on the macOS/HVF path
+/// (the guest sees it as ttyAMA0). On Linux/KVM the guest console is the
+/// virtio-console (hvc0) wired straight to the launcher's stdio, and there is
+/// no serial-pty device — so the flag is macOS-only. Returned as a slice so it
+/// drops cleanly out of the launcher arg chain on Linux.
+fn serial_pty_args() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &["--serial-pty"]
+    } else {
+        &[]
+    }
 }
 
 fn shell_kernel_cmdline(image_cmdline: Option<&str>) -> String {
