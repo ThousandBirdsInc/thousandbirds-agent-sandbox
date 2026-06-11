@@ -252,14 +252,18 @@ fn handle_client(mut client: TcpStream, state: &ProxyState) -> std::io::Result<(
             proxy_connect_tunnel(&mut client, parts[1])
         }
     } else {
-        let target_host = host_from_http_target(parts[1])
-            .or_else(|| host_from_headers(&mut lines.clone().peekable()));
-        if let Some(host) = &target_host {
-            if !egress_allowed(host, &state.egress_allowlist) {
-                return write_forbidden(&mut client, host);
-            }
-        }
         let headers: Vec<String> = lines.map(ToString::to_string).collect();
+        // Resolve the destination with the SAME parser used to open the
+        // upstream (`parse_http_target`), so the allowlist decision can never
+        // diverge from the host we actually connect to. A target we cannot
+        // resolve is denied, not allowed.
+        let Some((host, _, _)) = parse_http_target(parts[1], &headers, 80) else {
+            client.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")?;
+            return Ok(());
+        };
+        if !egress_allowed(&host, &state.egress_allowlist) {
+            return write_forbidden(&mut client, &host);
+        }
         proxy_http_to_new_upstream(
             &mut client,
             parts[0],
@@ -312,67 +316,6 @@ fn write_forbidden(client: &mut TcpStream, host: &str) -> std::io::Result<()> {
         body
     );
     client.write_all(response.as_bytes())
-}
-
-fn host_from_http_target(target: &str) -> Option<String> {
-    // For absolute URIs (proxy requests) extract the host. For origin-form
-    // paths (`/foo`) return None and let the caller fall back to the Host
-    // header.
-    if target.starts_with('/') {
-        return None;
-    }
-    let without_scheme = target
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(target);
-    let host_and_rest = without_scheme.split('/').next().unwrap_or("");
-    let host = host_and_rest
-        .split('@')
-        .next_back()
-        .unwrap_or(host_and_rest);
-    let host = host.split(':').next().unwrap_or(host);
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
-    }
-}
-
-fn host_from_headers<'a, I>(lines: &mut std::iter::Peekable<I>) -> Option<String>
-where
-    I: Iterator<Item = &'a str>,
-{
-    for line in lines {
-        let line = line.trim();
-        if line.is_empty() {
-            break;
-        }
-        if let Some(rest) = line.strip_prefix_ignore_ascii_case("host:") {
-            let host = rest.trim().split(':').next().unwrap_or("").trim();
-            if !host.is_empty() {
-                return Some(host.to_string());
-            }
-        }
-    }
-    None
-}
-
-trait StrExt {
-    fn strip_prefix_ignore_ascii_case<'a>(&'a self, prefix: &str) -> Option<&'a str>;
-}
-
-impl StrExt for str {
-    fn strip_prefix_ignore_ascii_case<'a>(&'a self, prefix: &str) -> Option<&'a str> {
-        if self.len() < prefix.len() {
-            return None;
-        }
-        let (head, tail) = self.split_at(prefix.len());
-        if head.eq_ignore_ascii_case(prefix) {
-            Some(tail)
-        } else {
-            None
-        }
-    }
 }
 
 fn proxy_connect_tunnel(client: &mut TcpStream, authority: &str) -> std::io::Result<()> {
@@ -794,15 +737,22 @@ mod tests {
     }
 
     #[test]
-    fn host_from_absolute_uri() {
-        assert_eq!(
-            host_from_http_target("http://api.example.com/v1/messages"),
-            Some("api.example.com".to_string())
+    fn allowlist_decision_uses_connection_host() {
+        // Regression: the allowlist must be evaluated against the exact host
+        // `parse_http_target` will connect to, not a separately-parsed value.
+        // A non-lowercase scheme makes the absolute-URI host unparseable, so
+        // the request falls through to the Host header — and the allowlist
+        // must judge *that* host, closing the prior parser-divergence bypass
+        // where `HTTP://allowed.com/` + `Host: evil.com` connected to evil.com
+        // while being approved as allowed.com.
+        let allowlist = vec!["allowed.com".to_string()];
+        let headers = vec!["Host: evil.com".to_string()];
+        let (host, _, _) =
+            parse_http_target("HTTP://allowed.com/", &headers, 80).expect("falls back to Host");
+        assert_eq!(host, "evil.com");
+        assert!(
+            !egress_allowed(&host, &allowlist),
+            "connection host (evil.com) must be the one judged by the allowlist"
         );
-        assert_eq!(
-            host_from_http_target("https://api.example.com:8443/v1"),
-            Some("api.example.com".to_string())
-        );
-        assert_eq!(host_from_http_target("/origin-form/path"), None);
     }
 }

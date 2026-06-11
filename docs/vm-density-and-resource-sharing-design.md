@@ -167,8 +167,9 @@ Two options:
    (`guest/agent-sandbox-shell` + the runtime-control mount).
 2. **virtiofs hot-plug** [krun]: attach the workspace device after boot. Cleaner but needs
    launcher support.
-3. **Snapshot/restore** [krun, long-term]: collapses most of boot; deferred in libkrun
-   today. The warm pool is the bridge until this lands.
+3. **Snapshot/restore** [krun]: collapses most of boot. This is now
+   code-complete; the remaining repo work is deciding when the scheduler should
+   choose restore-backed startup over a pre-booted warm-pool VM.
 
 Pool management lives in `SandboxManagerSdk` (`src/sdk.rs`), which already tracks per-VM
 processes and lifecycle.
@@ -321,7 +322,10 @@ freshly built `libkrun.dylib`.
   HVF vcpu loop (above). Largest, riskiest item; deferred deliberately.
 - **Warm pool late workspace attach (#F):** guest-side bind / virtio-fs hot-plug so a
   pooled VM can take an arbitrary per-session workspace.
-- **Snapshot/restore (#F):** the long-term cheap-scheduling lever; deferred in libkrun.
+- **Snapshot/restore-backed scheduling (#F):** libkrun snapshot/restore is now
+  code-complete; the remaining scheduling work is product policy — when to
+  prefer warm-pool reuse vs. restoring from a Full snapshot, and how to measure
+  both paths under real workloads.
 
 ---
 

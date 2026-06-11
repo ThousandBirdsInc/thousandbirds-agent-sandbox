@@ -11,7 +11,8 @@ use crate::quiesce::{QuiesceAction, QuiesceClient};
 use crate::scheduler::ResourceLedger;
 use crate::snapshot::{
     config_from_manifest, snapshot_dir as snapshot_dir_path, ForkOptions, RestoreOptions,
-    SnapshotId, SnapshotKind, SnapshotManifest, SnapshotOptions, SnapshotSummary,
+    SnapshotId, SnapshotKind, SnapshotManifest, SnapshotOptions, SnapshotPruneEntry,
+    SnapshotPruneReport, SnapshotSummary,
 };
 use std::env;
 use std::fs;
@@ -153,6 +154,10 @@ struct ManagedGvproxy {
     child: Child,
     socket_path: PathBuf,
     socket_dir: PathBuf,
+    /// Discovery file (runtime-control/network.json) advertising the gvproxy
+    /// HTTP control socket + guest IP so the SDK's `forward_port` can expose a
+    /// guest port natively. Removed on drop. None until `publish_discovery`.
+    discovery_file: Option<PathBuf>,
 }
 
 impl ManagedGvproxy {
@@ -167,15 +172,20 @@ impl ManagedGvproxy {
         let executable = find_gvproxy_executable(executable)?;
         let socket_dir = gvproxy_socket_dir()?;
         let socket_path = socket_dir.join("gvproxy.sock");
+        // HTTP control endpoint for the services API (forwarder expose/unexpose).
+        let api_socket = socket_dir.join("gvproxy-api.sock");
         let log_path = runtime_config.join("gvproxy.log");
         let ssh_port = available_localhost_port()?;
         remove_optional_file(&socket_path)?;
+        remove_optional_file(&api_socket)?;
 
         let log = fs::File::create(&log_path).map_err(|err| Error::io_path(&log_path, err))?;
         let mut child = Command::new(&executable)
             .arg("--debug")
             .arg("--listen-vfkit")
             .arg(format!("unixgram://{}", socket_path.display()))
+            .arg("--listen")
+            .arg(format!("unix://{}", api_socket.display()))
             .arg("--ssh-port")
             .arg(ssh_port.to_string())
             .stdin(Stdio::null())
@@ -194,12 +204,35 @@ impl ManagedGvproxy {
             child,
             socket_path,
             socket_dir,
+            discovery_file: None,
         })
+    }
+
+    /// Write `runtime-control/network.json` so the SDK (a separate process from
+    /// the one that owns gvproxy) can discover the control socket and route a
+    /// `forward_port` request through gvproxy's native port forwarder instead of
+    /// the file relay. Best-effort: a failure here just leaves forwards on the
+    /// relay path.
+    fn publish_discovery(&mut self, runtime_control: &Path) {
+        let api_socket = self.socket_dir.join("gvproxy-api.sock");
+        let guest_ip = gvproxy_guest_ip();
+        let path = runtime_control.join("network.json");
+        let body = format!(
+            "{{\n  \"gvproxy_api_socket\": \"{}\",\n  \"guest_ip\": \"{}\"\n}}\n",
+            json_escape(&api_socket.display().to_string()),
+            json_escape(&guest_ip),
+        );
+        if fs::write(&path, body).is_ok() {
+            self.discovery_file = Some(path);
+        }
     }
 }
 
 impl Drop for ManagedGvproxy {
     fn drop(&mut self) {
+        if let Some(path) = &self.discovery_file {
+            let _ = fs::remove_file(path);
+        }
         match self.child.try_wait() {
             Ok(Some(_)) => {}
             Ok(None) => {
@@ -325,13 +358,16 @@ impl SandboxManager {
         ResourceLedger::from_env(&self.state_root).admit(id.as_str(), stored.memory_mib as u64)?;
         let image = AgentImage::load(&stored.image_path)?;
         write_terminal_env(&stored.runtime_config)?;
-        let managed_gvproxy = match &stored.network_backend {
+        let mut managed_gvproxy = match &stored.network_backend {
             NetworkBackend::GvproxyAuto { executable } => Some(ManagedGvproxy::start(
                 &stored.runtime_config,
                 executable.as_deref(),
             )?),
             _ => None,
         };
+        if let Some(gvproxy) = managed_gvproxy.as_mut() {
+            gvproxy.publish_discovery(&stored.runtime_control);
+        }
         let launch_network_backend = managed_gvproxy
             .as_ref()
             .map(|gvproxy| NetworkBackend::Gvproxy {
@@ -377,6 +413,7 @@ impl SandboxManager {
         // Build the launcher command and run it ourselves (rather than the
         // fire-and-forget `launch` helper) so we can record the VM process PID in
         // the running reservation marker and release it once the VM exits.
+        let daemon_ports = self.daemon_vsock_ports(id);
         let mut command = launch_command(LaunchConfig {
             image: &image,
             root_disk: &stored.root_disk,
@@ -385,6 +422,7 @@ impl SandboxManager {
             memory_max_mib: stored.memory_max_mib,
             memory_min_mib: stored.memory_min_mib,
             control_socket: control_socket_arg,
+            vsock_ports: &daemon_ports,
             virtiofs_dax_size: stored.virtiofs_dax_size,
             workspace_mounts: &stored.workspace_mounts,
             credentials_mount: stored.credentials_staging.as_deref(),
@@ -394,7 +432,7 @@ impl SandboxManager {
             log_level: stored.log_level,
             // Phase 3: when this sandbox was built from a Full-kind
             // snapshot, restore_source points at the snapshot dir. The
-            // os_mode launcher passes it as --restore PATH, which makes
+            // tb-sandbox-runner passes it as --restore PATH, which makes
             // libkrun call Vmm::restore_memory_and_vm_state before
             // spawning vCPUs.
             restore_from: stored.restore_source.as_deref(),
@@ -423,7 +461,7 @@ impl SandboxManager {
         }
         if !status.success() {
             return Err(Error::ProcessFailed {
-                command: "libkrun os_mode launcher".to_string(),
+                command: "tb-sandbox-runner".to_string(),
                 status,
             });
         }
@@ -435,13 +473,16 @@ impl SandboxManager {
         ResourceLedger::from_env(&self.state_root).admit(id.as_str(), stored.memory_mib as u64)?;
         let image = AgentImage::load(&stored.image_path)?;
         write_terminal_env(&stored.runtime_config)?;
-        let managed_gvproxy = match &stored.network_backend {
+        let mut managed_gvproxy = match &stored.network_backend {
             NetworkBackend::GvproxyAuto { executable } => Some(ManagedGvproxy::start(
                 &stored.runtime_config,
                 executable.as_deref(),
             )?),
             _ => None,
         };
+        if let Some(gvproxy) = managed_gvproxy.as_mut() {
+            gvproxy.publish_discovery(&stored.runtime_control);
+        }
         let launch_network_backend = managed_gvproxy
             .as_ref()
             .map(|gvproxy| NetworkBackend::Gvproxy {
@@ -466,6 +507,7 @@ impl SandboxManager {
         } else {
             None
         };
+        let daemon_ports = self.daemon_vsock_ports(id);
         let mut command = launch_command(LaunchConfig {
             image: &image,
             root_disk: &stored.root_disk,
@@ -474,6 +516,7 @@ impl SandboxManager {
             memory_max_mib: stored.memory_max_mib,
             memory_min_mib: stored.memory_min_mib,
             control_socket: control_socket_arg,
+            vsock_ports: &daemon_ports,
             virtiofs_dax_size: stored.virtiofs_dax_size,
             workspace_mounts: &stored.workspace_mounts,
             credentials_mount: stored.credentials_staging.as_deref(),
@@ -483,7 +526,7 @@ impl SandboxManager {
             log_level: stored.log_level,
             // Phase 3: when this sandbox was built from a Full-kind
             // snapshot, restore_source points at the snapshot dir. The
-            // os_mode launcher passes it as --restore PATH, which makes
+            // tb-sandbox-runner passes it as --restore PATH, which makes
             // libkrun call Vmm::restore_memory_and_vm_state before
             // spawning vCPUs.
             restore_from: stored.restore_source.as_deref(),
@@ -598,7 +641,11 @@ impl SandboxManager {
                 socket.display()
             )));
         }
-        let response = send_control_command(&socket, &format!("target-mib {clamped}"))?;
+        let response = send_control_command(
+            &socket,
+            &format!("target-mib {clamped}"),
+            Some(Duration::from_secs(10)),
+        )?;
         if response.starts_with("error") {
             return Err(Error::InvalidArgument(format!(
                 "resize rejected by sandbox: {response}"
@@ -610,6 +657,28 @@ impl SandboxManager {
     /// Path of the per-sandbox Unix socket used for runtime control commands.
     pub fn control_socket_path(&self, id: &SandboxId) -> PathBuf {
         self.sandbox_dir(id).join("control.sock")
+    }
+
+    /// Host path of the per-sandbox Unix socket that libkrun bridges to the
+    /// in-guest `agent-sandbox-daemon` vsock port. The host `DaemonClient`
+    /// connects here; the guest daemon listens on
+    /// [`agent_sandbox_protocol::DAEMON_VSOCK_PORT`].
+    pub fn daemon_socket_path(&self, id: &SandboxId) -> PathBuf {
+        self.sandbox_dir(id).join("control.vsock")
+    }
+
+    /// Vsock port mappings to pass to the launcher for this sandbox. Empty when
+    /// the daemon transport is disabled via `TB_SANDBOX_NO_DAEMON`, which makes
+    /// boots fall back to the legacy request-file transport (and keeps older
+    /// launchers without `--vsock-port` working).
+    fn daemon_vsock_ports(&self, id: &SandboxId) -> Vec<(u32, PathBuf)> {
+        if std::env::var_os("TB_SANDBOX_NO_DAEMON").is_some() {
+            return Vec::new();
+        }
+        let socket = self.daemon_socket_path(id);
+        // Stale socket from a prior boot would make libkrun's listen() fail.
+        let _ = fs::remove_file(&socket);
+        vec![(agent_sandbox_protocol::DAEMON_VSOCK_PORT, socket)]
     }
 
     /// The sandbox's configured memory limits. Used by background reclaim to
@@ -721,6 +790,11 @@ impl SandboxManager {
             QuiesceAction::Sync
         };
 
+        // Set while the libkrun runner may still be writing snapshot files
+        // into `snap_dir` (the `snapshot-memory` command is in flight). If an
+        // error occurs in that window we leave the directory in place rather
+        // than racing the runner's writes with `remove_dir_all`.
+        let mut runner_engaged = false;
         let outcome = (|| -> Result<()> {
             // Hold the quiesce ticket across the disk clone so the guest
             // stays flushed/frozen for the duration. `ticket.take()` below
@@ -741,8 +815,19 @@ impl SandboxManager {
             let root_dst = snap_dir.join("root.raw");
             clone_or_copy_root(&stored.root_disk, &root_dst)?;
 
-            if let Some(t) = ticket.take() {
-                t.release(quiesce_timeout)?;
+            // Disk-only snapshots are coherent the moment the clone completes,
+            // so resume the guest immediately. Full (`capture_memory`)
+            // snapshots must keep the freeze held until *after* the memory
+            // capture below: otherwise the guest runs between the disk clone
+            // and the memory snapshot, mutating both disk and RAM, and the
+            // restored guest would replay captured memory that references
+            // on-disk state the clone never saw. Holding the freeze (fsfreeze)
+            // blocks the guest's disk writes for the whole window so the
+            // cloned disk and captured memory reflect the same instant.
+            if !opts.capture_memory {
+                if let Some(t) = ticket.take() {
+                    t.release(quiesce_timeout)?;
+                }
             }
 
             // Bundle credentials staging so a later restore can mount the
@@ -772,8 +857,23 @@ impl SandboxManager {
                         socket.display()
                     )));
                 }
+                // `snapshot-memory` writes the whole guest RAM (up to the boot
+                // ceiling) to disk before it acks, so the 10s control-socket
+                // timeout used for cheap balloon commands is far too short.
+                // Scale the deadline with guest size: a generous base plus
+                // time per GiB, bounded so a dead runner can't hang us forever.
+                let gib = (stored.memory_max_mib as u64).div_ceil(1024);
+                let memory_capture_timeout = Duration::from_secs(120 + gib * 60);
                 let cmd = format!("snapshot-memory {}", snap_dir.display());
-                let response = send_control_command(&socket, &cmd)?;
+                // From here until we read a complete response line, the runner
+                // may be writing files into `snap_dir`. If the command fails
+                // (e.g. times out) we must NOT delete the directory out from
+                // under it; see the cleanup branch below.
+                runner_engaged = true;
+                let response = send_control_command(&socket, &cmd, Some(memory_capture_timeout))?;
+                // Got a full response line: the runner has finished writing and
+                // resumed its vCPUs, so the directory is ours again.
+                runner_engaged = false;
                 if !response.starts_with("ok") {
                     return Err(Error::Internal(format!(
                         "libkrun snapshot-memory rejected: {response}"
@@ -783,6 +883,15 @@ impl SandboxManager {
             } else {
                 (SnapshotKind::DiskOnly, None)
             };
+
+            // Full-snapshot path: the disk clone and memory capture are both
+            // done, so release the freeze now (disk-only released right after
+            // the clone above). On any earlier `?` short-circuit the ticket's
+            // Drop sends a best-effort resume, and the guest's quiesce deadline
+            // auto-resumes as a final backstop.
+            if let Some(t) = ticket.take() {
+                t.release(quiesce_timeout)?;
+            }
 
             let manifest = SnapshotManifest {
                 version: 1,
@@ -817,6 +926,20 @@ impl SandboxManager {
 
         match outcome {
             Ok(()) => Ok(snap_id),
+            Err(err) if runner_engaged => {
+                // The `snapshot-memory` command never acked, so the libkrun
+                // runner may still be writing `memory.bin` into `snap_dir`.
+                // Deleting it now would race those writes, so leave the partial
+                // snapshot in place. It has no `manifest.json`, so `snapshots
+                // prune` classifies it as unusable and removes it once the
+                // sandbox is idle.
+                Err(Error::Internal(format!(
+                    "memory capture for snapshot {snap_id} failed and its directory {} was \
+                     left in place because the runner may still be writing it; remove it with \
+                     `snapshots prune --delete` once the sandbox is idle: {err}",
+                    snap_dir.display()
+                )))
+            }
             Err(err) => {
                 let _ = fs::remove_dir_all(&snap_dir);
                 Err(err)
@@ -876,7 +999,14 @@ impl SandboxManager {
         if config.name.is_none() {
             config.name = Some(new_id.as_str().to_string());
         }
-        let image = AgentImage::load(&manifest.image_path)?;
+        // Honor an `--image-path` override so a snapshot taken on one host
+        // (with its own absolute image path) can be restored on another where
+        // the agent image lives elsewhere. Falls back to the manifest path.
+        let image_path = opts
+            .image_path
+            .clone()
+            .unwrap_or_else(|| manifest.image_path.clone());
+        let image = AgentImage::load(&image_path)?;
 
         let outcome = (|| -> Result<Sandbox> {
             let root_disk = sandbox_dir.join("root.raw");
@@ -1130,6 +1260,48 @@ impl SandboxManager {
         fs::remove_dir_all(&dir).map_err(|err| Error::io_path(&dir, err))
     }
 
+    /// Find snapshot directories that cannot be restored by this build. By
+    /// default callers should pass `delete = false` and show the report; passing
+    /// `true` removes the unusable directories after they are identified.
+    pub fn prune_snapshots(&self, delete: bool) -> Result<SnapshotPruneReport> {
+        let root = self.state_root.join("snapshots");
+        if !root.exists() {
+            return Ok(SnapshotPruneReport {
+                deleted: delete,
+                entries: Vec::new(),
+            });
+        }
+
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&root).map_err(|err| Error::io_path(&root, err))? {
+            let entry = entry.map_err(Error::io)?;
+            if !entry.file_type().map_err(Error::io)?.is_dir() {
+                continue;
+            }
+            let dir = entry.path();
+            let id = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| SnapshotId::new(name.to_string()).ok());
+            let reason = snapshot_prune_reason(&dir, id.as_ref());
+            if let Some(reason) = reason {
+                if delete {
+                    fs::remove_dir_all(&dir).map_err(|err| Error::io_path(&dir, err))?;
+                }
+                entries.push(SnapshotPruneEntry {
+                    id,
+                    state_dir: dir,
+                    reason,
+                });
+            }
+        }
+        entries.sort_by(|a, b| a.state_dir.cmp(&b.state_dir));
+        Ok(SnapshotPruneReport {
+            deleted: delete,
+            entries,
+        })
+    }
+
     /// Resolve the directory a snapshot lives in under the configured state
     /// root.
     pub fn snapshot_dir(&self, id: &SnapshotId) -> PathBuf {
@@ -1189,6 +1361,62 @@ impl Default for SandboxManager {
     }
 }
 
+fn snapshot_prune_reason(dir: &Path, id: Option<&SnapshotId>) -> Option<String> {
+    let Some(id) = id else {
+        return Some("invalid snapshot directory name".to_string());
+    };
+    let manifest_path = dir.join("manifest.json");
+    let manifest_json = match fs::read_to_string(&manifest_path) {
+        Ok(json) => json,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Some("missing manifest.json".to_string());
+        }
+        Err(err) => return Some(format!("cannot read manifest.json: {err}")),
+    };
+    let manifest = match SnapshotManifest::from_json(&manifest_json) {
+        Ok(manifest) => manifest,
+        Err(err) => return Some(format!("invalid manifest.json: {err}")),
+    };
+    if &manifest.id != id {
+        return Some(format!(
+            "manifest id {} does not match directory name {}",
+            manifest.id, id
+        ));
+    }
+    let root_disk = dir.join("root.raw");
+    match fs::metadata(&root_disk) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Some("root.raw is not a file".to_string()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Some("missing root.raw".to_string());
+        }
+        Err(err) => return Some(format!("cannot stat root.raw: {err}")),
+    }
+    if let Err(err) = AgentImage::load(&manifest.image_path) {
+        return Some(format!("image is not loadable: {err}"));
+    }
+    if manifest.kind == SnapshotKind::Full {
+        let Some(memory_image_path) = &manifest.memory_image_path else {
+            return Some("full snapshot is missing memory_image_path".to_string());
+        };
+        let memory_image = dir.join(memory_image_path);
+        match fs::metadata(&memory_image) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Some(format!("{} is not a file", memory_image_path.display())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Some(format!("missing {}", memory_image_path.display()));
+            }
+            Err(err) => {
+                return Some(format!(
+                    "cannot stat {}: {err}",
+                    memory_image_path.display()
+                ))
+            }
+        }
+    }
+    None
+}
+
 fn default_state_root() -> PathBuf {
     if let Some(value) = env::var_os("TB_SANDBOX_STATE_DIR") {
         return PathBuf::from(value);
@@ -1235,6 +1463,31 @@ fn available_localhost_port() -> Result<u16> {
     let port = listener.local_addr().map_err(Error::io)?.port();
     drop(listener);
     Ok(port)
+}
+
+/// The IP the gvproxy userspace stack assigns the VM. gvproxy's default subnet
+/// is 192.168.127.0/24 with the gateway on .1 and the first (and, for a
+/// single-VM sandbox, only) DHCP lease on .2. Overridable for non-default
+/// gvproxy network configs.
+fn gvproxy_guest_ip() -> String {
+    env::var("TB_SANDBOX_GVPROXY_GUEST_IP").unwrap_or_else(|_| "192.168.127.2".to_string())
+}
+
+/// Minimal JSON string escaping for the hand-written discovery file (paths and
+/// IPs only — no control characters expected, but escape the structural ones).
+fn json_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn network_static_profile(network_backend: &NetworkBackend) -> &'static str {
@@ -1350,6 +1603,15 @@ fn copy_tree_std(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Best-effort probe: can this host auto-start a gvproxy backend? Used to
+/// decide whether to default new sandboxes to gvproxy (which gives the native,
+/// low-latency `forward_port` path that VNC/CDP need) instead of the built-in
+/// `None` backend (whose forwards fall back to the polled virtio-fs file relay).
+/// Gated on macOS because `ManagedGvproxy::start` only supports macOS.
+pub fn gvproxy_available() -> bool {
+    cfg!(target_os = "macos") && find_gvproxy_executable(None).is_ok()
 }
 
 fn find_gvproxy_executable(override_path: Option<&Path>) -> Result<PathBuf> {
@@ -1522,22 +1784,26 @@ fn write_runtime_config(dir: &Path, config: &SandboxConfig, image: &AgentImage) 
     );
     fs::write(&json_path, contents).map_err(|err| Error::io_path(&json_path, err))?;
 
+    // INITIAL_COMMAND is written LAST and intentionally so: its value is the
+    // multi-line guest command-server script, and keeping it at the end of the
+    // file lets write_initial_command_env() replace it by truncating from the
+    // `INITIAL_COMMAND=` line to EOF (a line-based replace would corrupt a
+    // multi-line value — see that function).
     let env_contents = format!(
         concat!(
             "SANDBOX_NAME={}\n",
             "GUEST_USER={}\n",
             "WORKSPACE={}\n",
             "SHELL_PATH={}\n",
-            "INITIAL_COMMAND={}\n",
             "AGENT_SANDBOX_DHCP={}\n",
             "AGENT_SANDBOX_NET_STATIC={}\n",
-            "AGENT_SANDBOX_PROFILE={}\n"
+            "AGENT_SANDBOX_PROFILE={}\n",
+            "INITIAL_COMMAND={}\n"
         ),
         shell_quote(config.name.as_deref().unwrap_or("sandbox")),
         shell_quote(&config.shell.guest_user),
         shell_quote(&config.shell.workspace),
         shell_quote(&config.shell.shell),
-        shell_quote(initial_command),
         if config.network_backend.is_enabled() {
             "1"
         } else {
@@ -1548,7 +1814,8 @@ fn write_runtime_config(dir: &Path, config: &SandboxConfig, image: &AgentImage) 
             "1"
         } else {
             ""
-        })
+        }),
+        shell_quote(initial_command)
     );
     fs::write(&env_path, env_contents).map_err(|err| Error::io_path(env_path, err))
 }
@@ -1581,24 +1848,23 @@ fn mount_config_field<'a>(value: &'a str, label: &str) -> Result<&'a str> {
 fn write_initial_command_env(dir: &Path, initial_command: &str) -> Result<()> {
     let env_path = dir.join("shell.env");
     let contents = fs::read_to_string(&env_path).map_err(|err| Error::io_path(&env_path, err))?;
-    let mut found = false;
+    // INITIAL_COMMAND lives last in shell.env and its (single-quoted) value may
+    // span many lines — the guest command-server script. Replace it by keeping
+    // every line up to the `INITIAL_COMMAND=` marker and dropping the rest
+    // (the old value, however many lines), then append the fresh value. A naive
+    // per-line replace would only swap the first line and leave the old value's
+    // tail behind as raw, unquoted shell that crashes `. shell.env`.
     let mut updated = String::new();
     for line in contents.lines() {
         if line.starts_with("INITIAL_COMMAND=") {
-            found = true;
-            updated.push_str("INITIAL_COMMAND=");
-            updated.push_str(&shell_quote(initial_command));
-            updated.push('\n');
-        } else {
-            updated.push_str(line);
-            updated.push('\n');
+            break;
         }
-    }
-    if !found {
-        updated.push_str("INITIAL_COMMAND=");
-        updated.push_str(&shell_quote(initial_command));
+        updated.push_str(line);
         updated.push('\n');
     }
+    updated.push_str("INITIAL_COMMAND=");
+    updated.push_str(&shell_quote(initial_command));
+    updated.push('\n');
     fs::write(&env_path, updated).map_err(|err| Error::io_path(env_path, err))
 }
 
@@ -1669,15 +1935,23 @@ fn remove_optional_file(path: &Path) -> Result<()> {
 
 /// Send a single line command to a sandbox's control socket and return the
 /// one-line response from the VMM.
+///
+/// `read_timeout` bounds how long we wait for the VMM's response line. Pass a
+/// short timeout for cheap commands (e.g. balloon `target-mib`); pass a
+/// generous timeout for commands whose work scales with guest size (e.g.
+/// `snapshot-memory`, which writes the entire guest RAM to disk before acking).
+/// `None` blocks indefinitely.
 #[cfg(unix)]
-fn send_control_command(socket: &Path, command: &str) -> Result<String> {
+fn send_control_command(
+    socket: &Path,
+    command: &str,
+    read_timeout: Option<Duration>,
+) -> Result<String> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
     let stream = UnixStream::connect(socket).map_err(|err| Error::io_path(socket, err))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(Error::io)?;
+    stream.set_read_timeout(read_timeout).map_err(Error::io)?;
     let mut writer = stream.try_clone().map_err(Error::io)?;
     writeln!(writer, "{command}").map_err(Error::io)?;
     writer.flush().map_err(Error::io)?;
@@ -1689,7 +1963,11 @@ fn send_control_command(socket: &Path, command: &str) -> Result<String> {
 }
 
 #[cfg(not(unix))]
-fn send_control_command(_socket: &Path, _command: &str) -> Result<String> {
+fn send_control_command(
+    _socket: &Path,
+    _command: &str,
+    _read_timeout: Option<Duration>,
+) -> Result<String> {
     Err(Error::InvalidArgument(
         "runtime memory resize is only supported on unix platforms".to_string(),
     ))
@@ -2346,6 +2624,64 @@ mod tests {
         assert!(!dir.exists());
         let err = manager.delete_snapshot(&snap_id).unwrap_err();
         assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[test]
+    fn prune_snapshots_reports_and_deletes_unusable_snapshots() {
+        let (manager, image) = snapshot_fixture("snapshot-prune");
+        let mut config = SandboxConfig::new(AgentImageRef::new(&image));
+        config.name = Some("src".to_string());
+        let sandbox = manager.create(config).unwrap();
+        let good = manager
+            .snapshot(
+                &sandbox.id,
+                SnapshotOptions {
+                    name: Some("good".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let missing_root = manager
+            .snapshot(
+                &sandbox.id,
+                SnapshotOptions {
+                    name: Some("missing-root".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        fs::remove_file(manager.snapshot_dir(&missing_root).join("root.raw")).unwrap();
+
+        let malformed = manager.state_root.join("snapshots/malformed");
+        fs::create_dir_all(&malformed).unwrap();
+        fs::write(malformed.join("manifest.json"), b"{not json").unwrap();
+        let invalid_name = manager.state_root.join("snapshots/bad.name");
+        fs::create_dir_all(&invalid_name).unwrap();
+
+        let dry_run = manager.prune_snapshots(false).unwrap();
+        assert!(!dry_run.deleted);
+        let labels: Vec<_> = dry_run
+            .entries
+            .iter()
+            .filter_map(|entry| entry.id.as_ref().map(|id| id.as_str().to_string()))
+            .collect();
+        assert_eq!(labels, vec!["malformed", "missing-root"]);
+        assert!(dry_run
+            .entries
+            .iter()
+            .any(|entry| entry.id.is_none() && entry.reason == "invalid snapshot directory name"));
+        assert!(manager.snapshot_dir(&good).exists());
+        assert!(manager.snapshot_dir(&missing_root).exists());
+        assert!(malformed.exists());
+        assert!(invalid_name.exists());
+
+        let deleted = manager.prune_snapshots(true).unwrap();
+        assert!(deleted.deleted);
+        assert_eq!(deleted.entries.len(), 3);
+        assert!(manager.snapshot_dir(&good).exists());
+        assert!(!manager.snapshot_dir(&missing_root).exists());
+        assert!(!malformed.exists());
+        assert!(!invalid_name.exists());
     }
 
     // -- cooperative quiesce on running snapshots ----------------------------

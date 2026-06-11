@@ -19,7 +19,13 @@ Build a reusable libkrun-os-bundle directory for agent image builds.
 Environment:
   BASE_BUNDLE=PATH                Existing bundle to reuse kernel/initramfs from
   KERNEL=PATH                     Kernel path override
+  BUILTIN_KERNEL=PATH             Built-in-driver kernel for a direct-boot bundle
   INITRAMFS=PATH                  Initramfs path override
+  KERNEL_FORMAT=N                 libkrun kernel format (default by platform)
+  NO_INITRAMFS=1|0                Direct boot (1), legacy initramfs (0), or auto
+  LIBKRUNFW_DIR=PATH              libkrunfw checkout to auto-locate Image.gz
+                                  (a direct-boot bundle is the default when one
+                                  is found; see README Startup Performance Notes)
   SOURCE_IMAGE=IMAGE              Base container image (default: tb-agent-sandbox-base:debian-systemd)
   SOURCE_CONTAINERFILE=PATH       Dockerfile/Containerfile to build SOURCE_IMAGE from
   SKIP_SOURCE_BUILD=1             Use SOURCE_IMAGE as-is instead of building it first
@@ -78,19 +84,67 @@ pick_runtime() {
   esac
 }
 
-kernel=${KERNEL:-}
+# --- Kernel + initramfs / direct-boot resolution ---------------------------
+#
+# A guest kernel with virtio_blk + ext4 built in (e.g. libkrunfw's Image.gz)
+# mounts /dev/vda directly, so the bundle needs no initramfs. That "direct-boot"
+# path is ~29% faster to cold-boot and ~47% smaller in idle footprint than the
+# initramfs path (see README "Startup Performance Notes"), so it is the default
+# whenever such a kernel can be found.
+#
+#   NO_INITRAMFS=1   require direct boot (fail if no built-in-driver kernel)
+#   NO_INITRAMFS=0   force the legacy initramfs bundle
+#   (unset)          auto: direct-boot if a built-in-driver kernel is located,
+#                    else fall back to the seed's initramfs kernel
+#   BUILTIN_KERNEL=PATH / KERNEL=PATH   pin the kernel explicitly
+#   LIBKRUNFW_DIR=PATH                  libkrunfw checkout to auto-locate Image.gz
+no_initramfs=${NO_INITRAMFS:-}
+kernel=${KERNEL:-${BUILTIN_KERNEL:-}}
 initramfs=${INITRAMFS:-}
+
+# Auto-locate a built-in-driver kernel from a libkrunfw checkout. arm64 only —
+# the verified direct-boot path; amd64 stays on the initramfs path unless a
+# kernel is pinned explicitly.
+autolocate_builtin_kernel() {
+  [ "$PLATFORM" = "linux/arm64" ] || return 1
+  for dir in \
+    "${LIBKRUNFW_DIR:-}" \
+    "$ROOT_DIR/../libkrunfw" \
+    "$LIBKRUN_DIR/../libkrunfw"; do
+    [ -n "$dir" ] || continue
+    cand=$(ls -1 "$dir"/linux-*/arch/arm64/boot/Image.gz 2>/dev/null | head -1 || true)
+    if [ -n "$cand" ] && [ -f "$cand" ]; then
+      printf "%s\n" "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [ -z "$kernel" ] && [ "$no_initramfs" != "0" ]; then
+  if builtin_kernel=$(autolocate_builtin_kernel); then
+    kernel=$builtin_kernel
+    no_initramfs=1
+    echo "==> Using built-in-driver kernel for direct boot: $kernel"
+  fi
+fi
+
 if [ -n "${BASE_BUNDLE:-}" ]; then
   kernel=${kernel:-"$BASE_BUNDLE/kernel"}
-  initramfs=${initramfs:-"$BASE_BUNDLE/initramfs"}
+  if [ "$no_initramfs" != "1" ]; then
+    initramfs=${initramfs:-"$BASE_BUNDLE/initramfs"}
+  fi
 fi
 
 if [ -z "$kernel" ] || [ ! -f "$kernel" ]; then
   echo "KERNEL or BASE_BUNDLE is required and must point to an existing kernel" >&2
   exit 66
 fi
-if [ -z "$initramfs" ] || [ ! -f "$initramfs" ]; then
+if [ "$no_initramfs" = "1" ]; then
+  initramfs=""
+elif [ -z "$initramfs" ] || [ ! -f "$initramfs" ]; then
   echo "INITRAMFS or BASE_BUNDLE is required and must point to an existing initramfs" >&2
+  echo "(or set NO_INITRAMFS=1 to build a direct-boot bundle with a built-in-driver kernel)" >&2
   exit 66
 fi
 
@@ -112,6 +166,10 @@ case "$PLATFORM" in
     exit 64
     ;;
 esac
+
+# A gzip-compressed arm64 Image (Image.gz) loads with format 2 (libkrun's PeGz
+# loader scans for the gzip magic); override for other kernel encodings.
+kernel_format=${KERNEL_FORMAT:-$kernel_format}
 
 runtime=$(pick_runtime)
 
@@ -142,6 +200,13 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# --initramfs is optional in the rootfs tool; omit it for a direct-boot bundle.
+if [ -n "$initramfs" ]; then
+  set -- --initramfs "$initramfs"
+else
+  set --
+fi
+
 "$LIBKRUN_DIR/examples/os_mode_build_container_rootfs.py" \
   --image "$SOURCE_IMAGE" \
   --output-dir "$build_dir/rootfs" \
@@ -151,7 +216,7 @@ trap cleanup EXIT INT TERM
   --init-mode systemd \
   --kernel "$kernel" \
   --kernel-format "$kernel_format" \
-  --initramfs "$initramfs" \
+  "$@" \
   --root-device /dev/vda \
   --root-fstype ext4 \
   --root-options rw \
@@ -163,14 +228,21 @@ mkdir -p "$OUTPUT_DIR"
 cp "$build_dir/rootfs/root.raw" "$OUTPUT_DIR/root.raw"
 cp "$build_dir/rootfs/manifest.json" "$OUTPUT_DIR/source-manifest.json"
 cp "$kernel" "$OUTPUT_DIR/kernel"
-cp "$initramfs" "$OUTPUT_DIR/initramfs"
+
+# Direct-boot bundles omit the initramfs file and its manifest key entirely.
+if [ -n "$initramfs" ]; then
+  cp "$initramfs" "$OUTPUT_DIR/initramfs"
+  initramfs_json='
+  "initramfs": "initramfs",'
+else
+  initramfs_json=''
+fi
 
 cat > "$OUTPUT_DIR/manifest.json" <<EOF
 {
   "kind": "libkrun.os-bundle.v1",
   "architecture": "$architecture",
-  "kernel": "kernel",
-  "initramfs": "initramfs",
+  "kernel": "kernel",$initramfs_json
   "root_disk": "root.raw",
   "kernel_format": $kernel_format,
   "root_device": "/dev/vda",
@@ -182,7 +254,7 @@ cat > "$OUTPUT_DIR/manifest.json" <<EOF
 }
 EOF
 
-echo "Built libkrun OS bundle:"
+echo "Built libkrun OS bundle ($([ -n "$initramfs" ] && echo "with initramfs" || echo "direct-boot, no initramfs")):"
 echo "  $OUTPUT_DIR"
 echo
 echo "Use it with:"

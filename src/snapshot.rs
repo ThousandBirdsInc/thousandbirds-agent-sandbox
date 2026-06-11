@@ -1,41 +1,42 @@
-//! Sandbox snapshots, restore, and VM forking — disk-state only.
+//! Sandbox snapshots, restore, and VM forking.
 //!
 //! ## What this is
 //!
-//! A snapshot is a directory under `<state_root>/snapshots/<snapshot_id>/`
-//! that bundles a sandbox's **root disk** at a point in time (APFS copy-on-write
-//! cloned, so creation is ~5 ms) together with a manifest of the sandbox's
-//! configuration. A restore consumes a snapshot to create a fresh sandbox whose
-//! root disk starts from the snapshot. A fork is the same operation in one step
-//! with no persisted intermediate snapshot.
+//! A snapshot is a directory under `<state_root>/snapshots/<snapshot_id>/`.
+//! Disk-only snapshots bundle a sandbox's root disk at a point in time together
+//! with a manifest of the sandbox's configuration. Full snapshots additionally
+//! carry guest memory + vCPU/device state when the linked libkrun build supports
+//! runtime capture. A restore consumes a snapshot to create a fresh sandbox
+//! whose root disk starts from the snapshot. A fork is the same operation in one
+//! step with no persisted intermediate snapshot.
 //!
 //! ## What this is NOT
 //!
-//! This is **disk-only** snapshot/restore. Guest memory, vCPU state, and live
-//! processes are not preserved — a restored sandbox cold-boots from the
-//! snapshot's disk. Memory + process preservation is the multi-month HVF work
-//! tracked in
-//! `../thousandbirds-libkrun/design_docs/snapshot_restore.md` and Phase 3 of
-//! `docs/closing-the-smolvm-gap-plan.md`. The manifest carries a `kind` field
-//! (`"disk-only"` today) so a later `"full"` kind can land without breaking the
-//! on-disk format.
+//! Disk-only snapshots do not preserve guest memory, vCPU state, or live
+//! processes; restored disk-only sandboxes cold-boot from the snapshotted disk.
+//! Full snapshots use the libkrun runtime snapshot path and restore with
+//! `--restore`, preserving the captured execution state on supported builds.
+//! The manifest's `kind` field is strict so newer snapshot kinds fail fast
+//! rather than silently degrading.
 //!
 //! ## On-disk layout
 //!
 //! ```text
 //! <state_root>/snapshots/<snapshot_id>/
 //!   manifest.json          # everything below, plus a human-readable note
-//!   root.raw               # APFS-cloned root disk at snapshot time
+//!   root.raw               # cloned root disk at snapshot time
+//!   memory.bin             # present for full snapshots
 //!   credentials-staging/   # present iff the parent sandbox had staged creds
 //! ```
 //!
 //! ## Crash consistency
 //!
-//! If the parent sandbox is running at snapshot time, the disk clone is
-//! **crash-consistent** — equivalent to pulling the power on a real machine.
-//! Filesystem replay on boot will roll the disk forward to a consistent state.
-//! There is no cooperative quiesce hook yet (Phase 2 of the gap plan); for
-//! agents this is acceptable because guests run journaling filesystems.
+//! If the parent sandbox is running and quiesce is enabled, the guest daemon
+//! flushes and optionally freezes the root filesystem before the disk clone.
+//! If quiesce is skipped, the disk clone is crash-consistent — equivalent to
+//! pulling the power on a real machine. Filesystem replay on boot will roll the
+//! disk forward to a consistent state, but in-flight application writes can be
+//! torn.
 
 use crate::config::{
     NetworkBackend, NetworkProxyConfig, ProxyHeaderRule, SandboxConfig, WorkspaceMount,
@@ -88,14 +89,9 @@ pub enum SnapshotKind {
     /// Root disk + sandbox configuration + guest memory image + vCPU + GIC
     /// + device state. Restore resumes from the captured execution point.
     ///
-    /// **Producing a `Full` snapshot needs a libkrun build with the
-    /// snapshot/restore API landed** (see Phase 3 of
-    /// `docs/closing-the-smolvm-gap-plan.md` and the matching libkrun
-    /// design doc `thousandbirds-libkrun/design_docs/snapshot_restore_implementation.md`).
-    /// `SandboxManager::snapshot` recognizes the kind and surfaces a typed
-    /// error when libkrun does not yet support it, so callers can write
-    /// against the surface today and pick up real memory capture as soon
-    /// as the libkrun-side work lands without a wrapper-side change.
+    /// Producing a `Full` snapshot needs a libkrun build with the runtime
+    /// snapshot/restore API and os_mode control socket support. Unsupported
+    /// libkrun builds reject the runtime `snapshot-memory` command cleanly.
     Full,
 }
 
@@ -161,8 +157,7 @@ pub struct SnapshotManifest {
 
     /// Path (relative to the snapshot directory) of the captured guest
     /// memory image when `kind == Full`. `None` for `DiskOnly` snapshots.
-    /// Today's wrapper does not produce these — Phase 3 of the gap plan
-    /// covers the libkrun-side capture work that will populate it.
+    /// Populated by the runtime `snapshot-memory` path for Full snapshots.
     pub memory_image_path: Option<PathBuf>,
 }
 
@@ -266,8 +261,8 @@ impl SnapshotManifest {
     }
 
     /// Parse a manifest from its JSON-on-disk form. Strict enough that an
-    /// unrecognized `kind` fails fast (so a future `"full"` snapshot does not
-    /// silently degrade to disk-only).
+    /// unrecognized `kind` fails fast, so newer snapshot formats do not silently
+    /// degrade to disk-only.
     pub fn from_json(json: &str) -> Result<Self> {
         let id = json_string(json, "id")
             .ok_or_else(|| Error::InvalidArgument("manifest missing 'id'".to_string()))?;
@@ -344,6 +339,23 @@ pub struct SnapshotSummary {
     pub root_disk_bytes: Option<u64>,
 }
 
+/// One unusable snapshot directory found by `snapshots prune`.
+#[derive(Debug, Clone)]
+pub struct SnapshotPruneEntry {
+    /// Parsed snapshot id when the directory name is valid.
+    pub id: Option<SnapshotId>,
+    pub state_dir: PathBuf,
+    pub reason: String,
+}
+
+/// Report returned by [`crate::runtime::SandboxManager::prune_snapshots`].
+#[derive(Debug, Clone)]
+pub struct SnapshotPruneReport {
+    /// Whether matching entries were deleted (`true`) or only reported (`false`).
+    pub deleted: bool,
+    pub entries: Vec<SnapshotPruneEntry>,
+}
+
 /// Options for `SandboxManager::snapshot`.
 ///
 /// Quiesce defaults — see [`crate::quiesce`] for the protocol:
@@ -372,12 +384,9 @@ pub struct SnapshotOptions {
     /// `SnapshotKind::Full` artifact whose restore resumes from the
     /// captured execution point rather than cold-booting from the disk.
     ///
-    /// Requires a libkrun build with the snapshot/restore API landed
-    /// (Phase 3 of `docs/closing-the-smolvm-gap-plan.md`). Until that
-    /// work ships, `SandboxManager::snapshot` returns a typed error
-    /// pointing at the gap plan. Callers can wire `capture_memory: true`
-    /// into their code today; it will start working as soon as the
-    /// libkrun side lands without a wrapper-side change.
+    /// Requires a libkrun build with the snapshot/restore API plus a runtime
+    /// control socket. Unsupported builds return a typed runtime-control error
+    /// rather than producing a partial Full snapshot.
     pub capture_memory: bool,
 }
 
@@ -401,6 +410,14 @@ impl Default for SnapshotOptions {
 pub struct RestoreOptions {
     /// ID for the restored sandbox. Defaults to `restore-<unix_millis>`.
     pub name: Option<String>,
+    /// Override the agent image directory recorded in the snapshot manifest.
+    /// The manifest stores an *absolute* `image_path` from the host that took
+    /// the snapshot; when restoring on a different host (e.g. resuming a
+    /// macOS-built disk-only snapshot on a GCP Arm node) the image rarely sits
+    /// at the same absolute path. Point this at the local agent image — it must
+    /// be the same guest architecture as the snapshotted rootfs. `None`
+    /// inherits the manifest's path.
+    pub image_path: Option<PathBuf>,
     /// Overrides the workspace mounts recorded in the snapshot. Pass an empty
     /// `Some(vec![])` to drop them entirely; `None` to inherit.
     pub workspace_mounts: Option<Vec<WorkspaceMount>>,
@@ -445,9 +462,11 @@ pub fn config_from_manifest(
     manifest: &SnapshotManifest,
     overrides: &RestoreOptions,
 ) -> SandboxConfig {
-    let mut config = SandboxConfig::new(crate::config::AgentImageRef::new(
-        manifest.image_path.clone(),
-    ));
+    let image_path = overrides
+        .image_path
+        .clone()
+        .unwrap_or_else(|| manifest.image_path.clone());
+    let mut config = SandboxConfig::new(crate::config::AgentImageRef::new(image_path));
     config.name = overrides.name.clone();
     config.cpus = overrides.cpus.unwrap_or(manifest.cpus);
     config.memory_mib = overrides.memory_mib.unwrap_or(manifest.memory_mib);
@@ -704,6 +723,7 @@ mod tests {
         let manifest = sample_manifest();
         let overrides = RestoreOptions {
             name: Some("restored".to_string()),
+            image_path: Some(PathBuf::from("/other/host/img/debian")),
             workspace_mounts: Some(Vec::new()),
             cpus: Some(4),
             memory_mib: Some(4096),
@@ -715,6 +735,10 @@ mod tests {
         };
         let config = config_from_manifest(&manifest, &overrides);
         assert_eq!(config.name.as_deref(), Some("restored"));
+        // The image-path override wins over the manifest's recorded path so a
+        // snapshot can be restored on a host where the agent image lives
+        // elsewhere.
+        assert_eq!(config.image.path, PathBuf::from("/other/host/img/debian"));
         assert_eq!(config.cpus, 4);
         assert_eq!(config.memory_mib, 4096);
         assert_eq!(config.memory_max_mib, 4096);

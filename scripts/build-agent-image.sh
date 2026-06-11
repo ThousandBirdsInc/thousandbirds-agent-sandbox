@@ -95,6 +95,16 @@ case "$PLATFORM" in
     ;;
 esac
 
+# Inherit the kernel format the base bundle was built with (e.g. a direct-boot
+# bundle's gzip Image.gz uses format 2 on arm64), then honor an explicit
+# override. Keeps the agent image's format consistent with its kernel.
+if [ -n "${BASE_BUNDLE:-}" ] && [ -f "$BASE_BUNDLE/manifest.json" ]; then
+  bundle_format=$(sed -n 's/.*"kernel_format"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    "$BASE_BUNDLE/manifest.json" | head -1)
+  [ -n "$bundle_format" ] && kernel_format=$bundle_format
+fi
+kernel_format=${KERNEL_FORMAT:-$kernel_format}
+
 build_image() {
   build_containerfile=$1
   tag_name=$2
@@ -124,10 +134,47 @@ fi
 
 build_image "$containerfile" "$tag" "$build_pull"
 
+# Build (or accept a prebuilt) static in-guest control daemon. The daemon is
+# the Daytona-gap Phase 1 transport: the host SDK execs/streams/cancels through
+# it over vsock instead of the legacy request-file relay. It is best-effort —
+# if it can't be produced, the image still boots and the SDK falls back to the
+# file-relay command server.
+#
+#   DAEMON_BIN=PATH   Use a prebuilt static daemon binary (skip container build)
+#   SKIP_DAEMON=1     Don't install the daemon (force file-relay fallback)
+daemon_bin="${DAEMON_BIN:-}"
+build_daemon_binary() {
+  out_dir=$1
+  # Compile as a static musl binary for the target platform in a throwaway Rust
+  # container. Only the two daemon crates are mounted, so the build never pulls
+  # in the libkrun-linked host crate. On alpine the musl target links fully
+  # static by default, so the result needs no guest libc.
+  "$runtime" run --rm \
+    --platform "$PLATFORM" \
+    -v "$ROOT_DIR/crates:/src:ro" \
+    -v "$out_dir:/out" \
+    rust:alpine \
+    sh -ec '
+      cp -r /src /tmp/crates
+      cd /tmp/crates/agent-sandbox-daemon
+      cargo build --release
+      cp target/release/agent-sandbox-daemon /out/agent-sandbox-daemon
+    '
+}
+if [ "${SKIP_DAEMON:-0}" != "1" ] && [ -z "$daemon_bin" ]; then
+  daemon_out=$(mktemp -d "${TMPDIR:-/tmp}/tb-agent-daemon.XXXXXX")
+  if build_daemon_binary "$daemon_out"; then
+    daemon_bin="$daemon_out/agent-sandbox-daemon"
+  else
+    echo "warning: failed to build agent-sandbox-daemon; image will use the file-relay fallback" >&2
+    daemon_bin=""
+  fi
+fi
+
 overlay_dir=$(mktemp -d "${TMPDIR:-/tmp}/tb-agent-overlay.XXXXXX")
 overlay_tar="$overlay_dir/overlay.tar"
 cleanup() {
-  rm -rf "$overlay_dir"
+  rm -rf "$overlay_dir" "${daemon_out:-}"
 }
 trap cleanup EXIT INT TERM
 
@@ -142,6 +189,16 @@ cp "$ROOT_DIR/guest/agent-sandbox-quiesce" "$overlay_dir/root/usr/local/bin/"
 # chromium is not present (only the `debian-bookworm-browser` variant
 # bakes it in). Cheap to ship in every image.
 cp "$ROOT_DIR/guest/agent-sandbox-browser" "$overlay_dir/root/usr/local/bin/"
+# In-guest control daemon + its systemd unit, when a binary was produced.
+if [ -n "$daemon_bin" ]; then
+  cp "$daemon_bin" "$overlay_dir/root/usr/local/bin/agent-sandbox-daemon"
+  chmod 0755 "$overlay_dir/root/usr/local/bin/agent-sandbox-daemon"
+  cp "$ROOT_DIR/guest/agent-sandbox-daemon.service" \
+    "$overlay_dir/root/etc/systemd/system/agent-sandbox-daemon.service"
+  ln -sf ../agent-sandbox-daemon.service \
+    "$overlay_dir/root/etc/systemd/system/multi-user.target.wants/agent-sandbox-daemon.service"
+  chmod 0644 "$overlay_dir/root/etc/systemd/system/agent-sandbox-daemon.service"
+fi
 sed "s|@SERIAL_TTY@|/dev/$console|g" \
   "$ROOT_DIR/guest/agent-sandbox-shell.service" \
   > "$overlay_dir/root/etc/systemd/system/agent-sandbox-shell.service"
@@ -171,6 +228,12 @@ initramfs=${INITRAMFS:-}
 no_initramfs=${NO_INITRAMFS:-}
 if [ -n "${BASE_BUNDLE:-}" ]; then
   kernel=${kernel:-"$BASE_BUNDLE/kernel"}
+  # A direct-boot base bundle ships no initramfs (its kernel has the drivers
+  # built in). Inherit that automatically so images built from it are
+  # direct-boot too, unless the caller pinned INITRAMFS or NO_INITRAMFS.
+  if [ -z "$no_initramfs" ] && [ -z "$initramfs" ] && [ ! -f "$BASE_BUNDLE/initramfs" ]; then
+    no_initramfs=1
+  fi
   if [ -z "$no_initramfs" ]; then
     initramfs=${initramfs:-"$BASE_BUNDLE/initramfs"}
   fi

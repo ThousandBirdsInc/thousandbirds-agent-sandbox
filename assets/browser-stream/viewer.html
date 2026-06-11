@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>tb-sandbox · browser stream</title>
+<!-- rrweb replay side is served by the same host stream server. -->
+<script src="/rrweb.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #15161a; color: #d7d9e0;
+    font: 13px/1.4 -apple-system, system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #bar { display: flex; gap: 8px; align-items: center; padding: 8px 10px;
+    background: #1d1f25; border-bottom: 1px solid #2b2e37; }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: #c0392b;
+    flex: none; box-shadow: 0 0 6px rgba(0,0,0,.4); }
+  #dot.live { background: #27ae60; }
+  #url { flex: 1; min-width: 0; padding: 6px 9px; border-radius: 6px;
+    border: 1px solid #343845; background: #0f1014; color: #e8eaf0;
+    font: inherit; }
+  #go { padding: 6px 12px; border-radius: 6px; border: 0; cursor: pointer;
+    background: #3b5bdb; color: #fff; font: inherit; }
+  #go:hover { background: #4263eb; }
+  #status { color: #8a8f9c; min-width: 120px; text-align: right;
+    white-space: nowrap; }
+  #stage { position: relative; flex: 1; overflow: hidden; background: #0b0c0f; }
+  /* The replay iframe lives inside #player. Pointer events pass THROUGH the
+     overlay to the iframe so the client browser renders native :hover and the
+     correct CSS cursor; we capture clicks/scroll on the iframe document and
+     forward them. The overlay only holds keyboard focus (pointer-events:none
+     still allows programmatic focus + key events). */
+  #player { position: absolute; inset: 0; }
+  #player .replayer-wrapper { transform-origin: 0 0; }
+  /* rrweb makes replay passive by setting the iframe to pointer-events:none in
+     liveMode; force it interactive so native :hover/cursor/scroll and our
+     captured clicks reach the page. !important beats rrweb's inline style. */
+  #player iframe { pointer-events: auto !important; }
+  #overlay { position: absolute; inset: 0; outline: none; pointer-events: none; }
+</style>
+</head>
+<body>
+  <div id="bar">
+    <span id="dot" title="connection"></span>
+    <input id="url" placeholder="https://example.com" spellcheck="false" />
+    <button id="go">Go</button>
+    <span id="status">connecting…</span>
+  </div>
+  <div id="stage">
+    <div id="player"></div>
+    <div id="overlay" tabindex="0"></div>
+  </div>
+<script>
+(function () {
+  "use strict";
+  var playerEl = document.getElementById("player");
+  var overlay = document.getElementById("overlay");
+  var dot = document.getElementById("dot");
+  var statusEl = document.getElementById("status");
+  var urlEl = document.getElementById("url");
+
+  // Recorded viewport (from rrweb Meta events) and the scale we render at so
+  // the page fits the stage. Both are needed to map client coords -> page
+  // coords for the input back-channel.
+  var rec = { w: 0, h: 0 };
+  var scale = 1;
+
+  var replayer = new rrweb.Replayer([], {
+    root: playerEl,
+    liveMode: true,
+    mouseTail: false,
+    useVirtualDom: false,
+  });
+  var started = false;
+  var lastLocalScroll = 0;
+
+  // Re-attach input every time rrweb finishes (re)building the page document.
+  // The iframe's document is recreated on navigation, and in liveMode addEvent
+  // renders asynchronously — so we must wire AFTER the rebuild, not when the
+  // snapshot event arrives (otherwise the visible document has no listeners and
+  // clicks do nothing). A slow interval backstops any missed rebuild signal.
+  // enableInteract() re-enables the iframe's pointer-events + scrolling that
+  // rrweb disables for passive replay; call it whenever the document rebuilds
+  // (and on an interval backstop) so interaction keeps working after navigation.
+  function makeInteractive() {
+    try { replayer.enableInteract(); } catch (e) {}
+    wireInput();
+  }
+  replayer.on("fullsnapshot-rebuilded", makeInteractive);
+  setInterval(makeInteractive, 500);
+
+  function setStatus(t) { statusEl.textContent = t; }
+
+  function fit() {
+    if (!rec.w || !rec.h) return;
+    var sw = playerEl.clientWidth, sh = playerEl.clientHeight;
+    scale = Math.min(sw / rec.w, sh / rec.h, 1) || 1;
+    var wrap = playerEl.querySelector(".replayer-wrapper");
+    if (wrap) wrap.style.transform = "scale(" + scale + ")";
+  }
+  window.addEventListener("resize", fit);
+
+  function handleEvent(ev) {
+    // rrweb event types: 4 == Meta (carries viewport width/height).
+    if (ev.type === 4 && ev.data) {
+      rec.w = ev.data.width || rec.w;
+      rec.h = ev.data.height || rec.h;
+      if (ev.data.href) urlEl.value = ev.data.href;
+    }
+    // Drop echoed root-scroll events (type 3 == IncrementalSnapshot,
+    // source 3 == Scroll) while the user is actively scrolling locally — the
+    // server's throttled scroll would otherwise yank our instant local position
+    // backwards.
+    if (ev.type === 3 && ev.data && ev.data.source === 3 &&
+        (Date.now() - lastLocalScroll) < 600) {
+      return;
+    }
+    if (!started) { replayer.startLive(ev.timestamp - 500); started = true; }
+    replayer.addEvent(ev);
+    // Input is (re)wired via the replayer's "fullsnapshot-rebuilded" hook +
+    // interval backstop (see above) — that fires after rrweb actually builds
+    // the document, which addEvent does not do synchronously in liveMode.
+    if (ev.type === 4) setTimeout(fit, 0);
+  }
+
+  // ---- transport ---------------------------------------------------------
+  var ws;
+  function connect() {
+    var proto = location.protocol === "https:" ? "wss" : "ws";
+    ws = new WebSocket(proto + "://" + location.host + "/ws");
+    ws.onopen = function () { dot.classList.add("live"); setStatus("live"); };
+    ws.onclose = function () {
+      dot.classList.remove("live"); setStatus("disconnected — retrying…");
+      setTimeout(connect, 1000);
+    };
+    ws.onmessage = function (m) {
+      var ev;
+      try { ev = JSON.parse(m.data); } catch (e) { return; }
+      handleEvent(ev);
+    };
+  }
+  function send(obj) {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+  }
+  connect();
+
+  // ---- input back-channel ------------------------------------------------
+  // Pointer events reach the replay iframe directly (overlay is
+  // pointer-events:none), so the client browser renders native :hover and the
+  // right CSS cursor with zero latency. We capture on the iframe document and
+  // forward clicks/keys/scroll to the real browser. Coordinates inside the
+  // iframe are already page-viewport pixels (unaffected by the fit transform),
+  // which is exactly CDP's coordinate space.
+  var scrollSyncTimer = null;
+  var lastMove = 0;
+  var BTN = { 0: "left", 1: "middle", 2: "right" };
+
+  function mods(e) {
+    return (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) |
+           (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
+  }
+  function replayWin() {
+    var ifr = playerEl.querySelector("iframe");
+    return ifr && ifr.contentWindow;
+  }
+  // Tell the real browser where we scrolled to, so lazy/dynamic content loads
+  // and click coordinates stay aligned with what's on screen.
+  function syncScrollNow() {
+    var w = replayWin();
+    if (w) send({ t: "scroll", x: w.scrollX || 0, y: w.scrollY || 0 });
+  }
+  function scheduleScrollSync() {
+    if (scrollSyncTimer) return;
+    scrollSyncTimer = setTimeout(function () {
+      scrollSyncTimer = null; syncScrollNow();
+    }, 80);
+  }
+  function sendKey(e, a) {
+    if (document.activeElement === urlEl) return;  // let the URL bar type
+    e.preventDefault();
+    send({ t: "key", a: a, key: e.key, code: e.code, keyCode: e.keyCode,
+           text: (e.key && e.key.length === 1) ? e.key : "", modifiers: mods(e) });
+  }
+
+  // Stable handler references (so removeEventListener works) for the replay
+  // iframe's document.
+  var H = {
+    contextmenu: function (e) { e.preventDefault(); },
+    mousemove: function (e) {
+      var now = Date.now();
+      if (now - lastMove < 40) return;   // throttle hover/move spam over the wire
+      lastMove = now;
+      // Forward moves so JS-driven hover on the real page fires; native CSS
+      // :hover already happened locally for free.
+      send({ t: "mouse", a: "move", x: e.clientX, y: e.clientY, modifiers: mods(e) });
+    },
+    mousedown: function (e) {
+      // Stop the replay following links / selecting / stealing focus, but keep
+      // keyboard on the overlay.
+      e.preventDefault();
+      try { overlay.focus(); } catch (_) {}
+      syncScrollNow();   // align the real browser before the click lands
+      send({ t: "mouse", a: "down", x: e.clientX, y: e.clientY,
+             button: BTN[e.button] || "left", modifiers: mods(e) });
+    },
+    mouseup: function (e) {
+      e.preventDefault();
+      send({ t: "mouse", a: "up", x: e.clientX, y: e.clientY,
+             button: BTN[e.button] || "left", modifiers: mods(e) });
+    },
+    click: function (e) { e.preventDefault(); },
+    scroll: function () { lastLocalScroll = Date.now(); scheduleScrollSync(); },
+  };
+
+  // (Re)attach input listeners to the replay iframe's document. rrweb rebuilds
+  // that document on navigation via document.open(), which strips event
+  // listeners — so we cannot rely on a "wired" flag (it would survive while the
+  // listeners do not). Instead, remove-then-add stable handlers every call; this
+  // is idempotent (no duplicates) and re-attaches after each rebuild.
+  function wireInput() {
+    try {
+      var ifr = playerEl.querySelector("iframe");
+      var doc = ifr && ifr.contentDocument;   // same-origin (rrweb)
+      var win = ifr && ifr.contentWindow;
+      if (!doc || !win) return;
+      ["contextmenu", "mousemove", "mousedown", "mouseup", "click"].forEach(function (type) {
+        doc.removeEventListener(type, H[type], true);
+        doc.addEventListener(type, H[type], true);
+      });
+      win.removeEventListener("scroll", H.scroll, true);
+      win.addEventListener("scroll", H.scroll, true);
+    } catch (e) { /* iframe not ready / not same-origin yet; retried shortly */ }
+  }
+
+  // Keyboard stays on the overlay (focusable even with pointer-events:none);
+  // mousedown above moves focus here so keystrokes are captured.
+  overlay.addEventListener("keydown", function (e) { sendKey(e, "down"); });
+  overlay.addEventListener("keyup", function (e) { sendKey(e, "up"); });
+
+  // ---- navigation bar ----------------------------------------------------
+  function navigate() {
+    var u = urlEl.value.trim();
+    if (!u) return;
+    // Prepend https:// only when there's no scheme; leave data:/about:/file:/…
+    // (single-colon schemes without "//") intact.
+    if (!/^[a-z][a-z0-9+.-]*:/i.test(u)) u = "https://" + u;
+    send({ t: "nav", url: u });
+    overlay.focus();
+  }
+  document.getElementById("go").addEventListener("click", navigate);
+  urlEl.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") navigate();
+  });
+})();
+</script>
+</body>
+</html>

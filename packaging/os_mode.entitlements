@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Distribution entitlements for the os_mode launcher (the process that calls
+  Hypervisor.framework). Only the hypervisor entitlement is needed:
+
+  - We sign os_mode AND libkrun.1.dylib with the same Developer ID (same Team
+    ID), so library validation passes naturally — no disable-library-validation.
+  - os_mode finds the dylib via an @rpath of @loader_path (the release script
+    rewrites the install names), so no DYLD_* env var is used — no
+    allow-dyld-environment-variables needed.
+
+  com.apple.security.hypervisor is permitted on notarized Developer ID builds
+  (the same path UTM / Lima / Docker Desktop / krunkit use); it does not require
+  a provisioning profile.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.hypervisor</key>
+	<true/>
+</dict>
+</plist>

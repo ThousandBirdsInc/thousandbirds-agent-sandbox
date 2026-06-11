@@ -236,6 +236,7 @@ fn read_macos_claude_keychain_credentials() -> Result<Option<Vec<u8>>> {
     Ok(None)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn looks_like_claude_credentials_json(value: &[u8]) -> bool {
     std::str::from_utf8(value)
         .map(|text| text.contains("\"claudeAiOauth\""))

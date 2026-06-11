@@ -1,4 +1,5 @@
 use crate::config::SandboxConfig;
+use crate::daemon_client::{DaemonClient, PtyOptions};
 use crate::error::{Error, Result};
 use crate::runtime::{Sandbox, SandboxId, SandboxManager, WorkspaceMountInfo};
 use async_trait::async_trait;
@@ -21,7 +22,7 @@ const STREAM_CHANNEL_CAPACITY: usize = 64;
 /// How often the host polls response files / child exit while tailing output.
 const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// How often the host port-forwarder polls the relay file for new guest bytes.
-const FORWARD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const FORWARD_POLL_INTERVAL: Duration = Duration::from_millis(1);
 /// How long the SDK waits for an active session's command server to report
 /// ready before giving up.
 const SESSION_READY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -82,6 +83,10 @@ pub struct GuestProcess {
 pub struct PortForward {
     pub host: String,
     pub port: u16,
+    /// True when the forward routes through gvproxy's native forwarder
+    /// (low-latency real TCP into the guest); false when it falls back to the
+    /// polled virtio-fs file relay (much higher latency — unusable for VNC).
+    pub native: bool,
 }
 
 #[async_trait]
@@ -95,16 +100,40 @@ pub trait SandboxRuntimeSdk: Send + Sync {
     async fn cancel_process(&self, id: &SandboxId, process_id: &str) -> Result<()>;
     async fn stop_session(&self, id: &SandboxId) -> Result<()>;
     async fn delete_session(&self, id: &SandboxId) -> Result<()>;
+
+    /// Identifiers of every sandbox this runtime knows about. Used by the API
+    /// server's `list` operation. Order is unspecified.
+    async fn list_sessions(&self) -> Result<Vec<SandboxId>>;
+
+    /// Whether `id` currently has a live VM/session. Used by the API server's
+    /// `inspect` operation to report `running` vs `stopped` state.
+    async fn session_running(&self, id: &SandboxId) -> Result<bool>;
 }
 
-/// A live port forward owned by this SDK instance: the host-side relay task and
-/// the guest-side forwarder process. Tracked so the forward can be torn down
-/// explicitly or when its session stops, instead of leaking until process exit.
+/// A live port forward owned by this SDK instance. Tracked so the forward can be
+/// torn down explicitly or when its session stops, instead of leaking until
+/// process exit. Two transports exist:
+/// - `Relay`: the universal file-relay path (host-side relay task + guest-side
+///   forwarder process), used when no native fast path is available.
+/// - `Native`: gvproxy binds the host port and routes straight into the guest;
+///   teardown unexposes it via the gvproxy control socket. No relay task or
+///   guest process is involved.
+#[derive(Debug)]
+enum ForwardTransport {
+    Relay {
+        guest_process_id: String,
+        host_task: tokio::task::AbortHandle,
+    },
+    Native {
+        api_socket: PathBuf,
+        local_addr: String,
+    },
+}
+
 #[derive(Debug)]
 struct ActiveForward {
     local_port: u16,
-    guest_process_id: String,
-    host_task: tokio::task::AbortHandle,
+    transport: ForwardTransport,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +141,12 @@ pub struct SandboxManagerSdk {
     manager: SandboxManager,
     cancels: Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<()>>>>,
     forwards: Arc<Mutex<HashMap<String, Vec<ActiveForward>>>>,
+    /// Cached daemon connections, one per running sandbox. The host
+    /// `DaemonClient` is cheap to clone and shares a single connection.
+    daemon_clients: Arc<Mutex<HashMap<String, DaemonClient>>>,
+    /// Maps a daemon-backed process id to its connection + numeric daemon id so
+    /// `cancel_process` can signal it.
+    daemon_cancels: Arc<Mutex<HashMap<String, (DaemonClient, u64)>>>,
     next_process: Arc<AtomicU64>,
     next_forward: Arc<AtomicU64>,
     host_translate: bool,
@@ -123,6 +158,8 @@ impl SandboxManagerSdk {
             manager,
             cancels: Arc::new(Mutex::new(HashMap::new())),
             forwards: Arc::new(Mutex::new(HashMap::new())),
+            daemon_clients: Arc::new(Mutex::new(HashMap::new())),
+            daemon_cancels: Arc::new(Mutex::new(HashMap::new())),
             next_process: Arc::new(AtomicU64::new(1)),
             next_forward: Arc::new(AtomicU64::new(1)),
             host_translate: false,
@@ -144,6 +181,14 @@ impl SandboxManagerSdk {
         &self.manager
     }
 
+    /// Whether a persistent guest command-server session is currently running
+    /// for `id`. Lets callers (e.g. `browser stream`) decide whether they own
+    /// the session's lifecycle.
+    pub async fn session_active(&self, id: &SandboxId) -> Result<bool> {
+        let sandbox = self.reopen_session(id).await?;
+        Ok(active_session_pid_async(sandbox.state_dir).await?.is_some())
+    }
+
     /// Tear down every port forward this instance started for `id`: abort the
     /// host relay tasks (dropping their listeners) and cancel the guest-side
     /// forwarder processes. Best-effort; safe to call when none exist.
@@ -153,10 +198,30 @@ impl SandboxManagerSdk {
             return Ok(());
         };
         for forward in forwards {
-            forward.host_task.abort();
-            let _ = self.cancel_process(id, &forward.guest_process_id).await;
+            self.tear_down_forward(id, forward.transport).await;
         }
         Ok(())
+    }
+
+    /// Release a single forward's transport: abort the relay task and cancel the
+    /// guest forwarder, or unexpose the gvproxy mapping. Best-effort.
+    async fn tear_down_forward(&self, id: &SandboxId, transport: ForwardTransport) {
+        match transport {
+            ForwardTransport::Relay {
+                guest_process_id,
+                host_task,
+            } => {
+                host_task.abort();
+                let _ = self.cancel_process(id, &guest_process_id).await;
+            }
+            ForwardTransport::Native {
+                api_socket,
+                local_addr,
+            } => {
+                let body = format!("{{\"local\":\"{local_addr}\",\"protocol\":\"tcp\"}}");
+                let _ = gvproxy_api_post(&api_socket, "/services/forwarder/unexpose", &body).await;
+            }
+        }
     }
 
     /// Tear down a single port forward identified by its host endpoint.
@@ -166,21 +231,20 @@ impl SandboxManagerSdk {
             return Ok(());
         };
         let mut removed = Vec::new();
-        list.retain(|active| {
-            if active.local_port == forward.port {
-                removed.push(active.guest_process_id.clone());
-                active.host_task.abort();
-                false
+        let mut index = 0;
+        while index < list.len() {
+            if list[index].local_port == forward.port {
+                removed.push(list.remove(index).transport);
             } else {
-                true
+                index += 1;
             }
-        });
+        }
         if list.is_empty() {
             guard.remove(id.as_str());
         }
         drop(guard);
-        for process_id in removed {
-            let _ = self.cancel_process(id, &process_id).await;
+        for transport in removed {
+            self.tear_down_forward(id, transport).await;
         }
         Ok(())
     }
@@ -450,6 +514,12 @@ impl SandboxRuntimeSdk for SandboxManagerSdk {
             .await?
             .is_some()
         {
+            // Prefer the in-guest daemon (streamed over vsock, no file polling).
+            // Fall back to the legacy request-file command server when the
+            // daemon is unreachable (older image, or TB_SANDBOX_NO_DAEMON).
+            if let Some(client) = self.daemon_for(&sandbox.id).await {
+                return self.exec_via_daemon(client, sandbox, command).await;
+            }
             let control_dir = sandbox.state_dir.join("runtime-control");
             if !wait_for_session_ready(&control_dir, SESSION_READY_TIMEOUT).await? {
                 return Err(Error::InvalidArgument(format!(
@@ -464,8 +534,10 @@ impl SandboxRuntimeSdk for SandboxManagerSdk {
         let id = id.clone();
         let initial_command = guest_command_to_shell(&command)?;
         let process_id = format!(
-            "{}:process-{}",
+            "{}:process-{}-{}-{}",
             id.as_str(),
+            std::process::id(),
+            now_millis(),
             self.next_process.fetch_add(1, Ordering::Relaxed)
         );
         let mut launch = tokio::task::spawn_blocking(move || {
@@ -561,13 +633,43 @@ impl SandboxRuntimeSdk for SandboxManagerSdk {
             )));
         }
 
+        // Fast path: if the running session advertises a gvproxy control socket,
+        // expose the guest port through gvproxy's native forwarder. gvproxy binds
+        // the host port and routes straight into the guest's network — no file
+        // relay, no polling. Falls through to the universal relay path on any
+        // failure (non-gvproxy backend, missing socket, expose rejected).
+        if let Some((api_socket, guest_ip)) = read_network_discovery(&control_dir).await {
+            if let Some(local_port) = try_native_forward(&api_socket, &guest_ip, guest_port).await {
+                let local_addr = format!("127.0.0.1:{local_port}");
+                self.forwards
+                    .lock()
+                    .await
+                    .entry(id.as_str().to_string())
+                    .or_default()
+                    .push(ActiveForward {
+                        local_port,
+                        transport: ForwardTransport::Native {
+                            api_socket,
+                            local_addr,
+                        },
+                    });
+                return Ok(PortForward {
+                    host: "127.0.0.1".to_string(),
+                    port: local_port,
+                    native: true,
+                });
+            }
+        }
+
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .map_err(Error::io)?;
         let local_port = listener.local_addr().map_err(Error::io)?.port();
         let forward_id = format!(
-            "{}-forward-{}",
+            "{}-forward-{}-{}-{}",
             id.as_str(),
+            std::process::id(),
+            now_millis(),
             self.next_forward.fetch_add(1, Ordering::Relaxed)
         );
         let forward_dir = control_dir.join("forwards").join(&forward_id);
@@ -599,12 +701,15 @@ impl SandboxRuntimeSdk for SandboxManagerSdk {
             .or_default()
             .push(ActiveForward {
                 local_port,
-                guest_process_id,
-                host_task,
+                transport: ForwardTransport::Relay {
+                    guest_process_id,
+                    host_task,
+                },
             });
         Ok(PortForward {
             host: "127.0.0.1".to_string(),
             port: local_port,
+            native: false,
         })
     }
 
@@ -617,6 +722,10 @@ impl SandboxRuntimeSdk for SandboxManagerSdk {
     }
 
     async fn cancel_process(&self, id: &SandboxId, process_id: &str) -> Result<()> {
+        // Daemon-backed processes: signal the guest process group over vsock.
+        if let Some((client, daemon_id)) = self.daemon_cancels.lock().await.remove(process_id) {
+            return client.cancel(daemon_id).await;
+        }
         if let Some(sender) = self.cancels.lock().await.remove(process_id) {
             let _ = sender.send(());
             return Ok(());
@@ -651,9 +760,125 @@ impl SandboxRuntimeSdk for SandboxManagerSdk {
             .await
             .map_err(|err| Error::Internal(format!("join delete session task: {err}")))?
     }
+
+    async fn list_sessions(&self) -> Result<Vec<SandboxId>> {
+        let manager = self.manager.clone();
+        tokio::task::spawn_blocking(move || {
+            Ok(manager
+                .list()?
+                .into_iter()
+                .map(|summary| summary.id)
+                .collect())
+        })
+        .await
+        .map_err(|err| Error::Internal(format!("join list sessions task: {err}")))?
+    }
+
+    async fn session_running(&self, id: &SandboxId) -> Result<bool> {
+        let manager = self.manager.clone();
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || Ok(manager.is_running(&id)))
+            .await
+            .map_err(|err| Error::Internal(format!("join session running task: {err}")))?
+    }
 }
 
 impl SandboxManagerSdk {
+    /// Return a connected, healthy daemon client for `id`, or `None` if the
+    /// daemon transport is unavailable (no socket yet, unhealthy, disabled, or
+    /// an older image without the daemon). Successful connections are cached and
+    /// shared. A dead cached connection is detected by a failing health check
+    /// and refreshed.
+    async fn daemon_for(&self, id: &SandboxId) -> Option<DaemonClient> {
+        if std::env::var_os("TB_SANDBOX_NO_DAEMON").is_some() {
+            return None;
+        }
+        if let Some(client) = self.daemon_clients.lock().await.get(id.as_str()).cloned() {
+            if matches!(
+                tokio::time::timeout(Duration::from_secs(2), client.health()).await,
+                Ok(Ok(_))
+            ) {
+                return Some(client);
+            }
+            self.daemon_clients.lock().await.remove(id.as_str());
+        }
+
+        let socket = self.manager.daemon_socket_path(id);
+        if !socket.exists() {
+            return None;
+        }
+        let client = match tokio::time::timeout(
+            Duration::from_secs(2),
+            DaemonClient::connect(&socket),
+        )
+        .await
+        {
+            Ok(Ok(client)) => client,
+            _ => return None,
+        };
+        match tokio::time::timeout(Duration::from_secs(2), client.health()).await {
+            Ok(Ok(_)) => {}
+            _ => return None,
+        }
+        self.daemon_clients
+            .lock()
+            .await
+            .insert(id.as_str().to_string(), client.clone());
+        Some(client)
+    }
+
+    /// Run a command through the in-guest daemon, returning a [`GuestProcess`]
+    /// whose streams are fed by the multiplexed connection. Registers the
+    /// process for cancellation and de-registers it when it exits.
+    async fn exec_via_daemon(
+        &self,
+        client: DaemonClient,
+        sandbox: Sandbox,
+        command: GuestCommand,
+    ) -> Result<GuestProcess> {
+        let command = if self.host_translate {
+            let mounts = self.inspect_mounts(&sandbox.id).await?;
+            let mut command = command;
+            translate_guest_paths_to_host(&mut command, &mounts);
+            command
+        } else {
+            command
+        };
+
+        let (daemon_id, proc) = client.exec(&command, PtyOptions::off()).await?;
+        let process_id = proc.id.clone();
+        self.daemon_cancels
+            .lock()
+            .await
+            .insert(process_id.clone(), (client, daemon_id));
+
+        // Wrap `exit` so the cancel registration is cleaned up on completion
+        // without changing the GuestProcess contract for callers.
+        let GuestProcess {
+            id,
+            stdout,
+            stderr,
+            exit,
+        } = proc;
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let daemon_cancels = self.daemon_cancels.clone();
+        let cleanup_id = process_id.clone();
+        tokio::spawn(async move {
+            let result = exit.await;
+            daemon_cancels.lock().await.remove(&cleanup_id);
+            if let Ok(result) = result {
+                let _ = exit_tx.send(result);
+            }
+        });
+
+        Ok(GuestProcess {
+            id,
+            stdout,
+            stderr,
+            exit: exit_rx,
+        })
+    }
+
     async fn exec_in_active_session(
         &self,
         sandbox: Sandbox,
@@ -673,8 +898,10 @@ impl SandboxManagerSdk {
         };
         let initial_command = guest_command_to_shell(&command)?;
         let process_id = format!(
-            "{}:process-{}",
+            "{}:process-{}-{}-{}",
             sandbox.id.as_str(),
+            std::process::id(),
+            now_millis(),
             self.next_process.fetch_add(1, Ordering::Relaxed)
         );
         let control_dir = sandbox.state_dir.join("runtime-control");
@@ -848,8 +1075,10 @@ impl SandboxRuntimeSdk for LocalProcessSandboxRuntime {
             Error::InvalidArgument("guest command argv must not be empty".to_string())
         })?;
         let process_id = format!(
-            "{}:process-{}",
+            "{}:process-{}-{}-{}",
             id.as_str(),
+            std::process::id(),
+            now_millis(),
             self.next_process.fetch_add(1, Ordering::Relaxed)
         );
         let mut child = Command::new(program);
@@ -928,6 +1157,7 @@ impl SandboxRuntimeSdk for LocalProcessSandboxRuntime {
         Ok(PortForward {
             host: "127.0.0.1".to_string(),
             port: guest_port,
+            native: true,
         })
     }
 
@@ -962,6 +1192,18 @@ impl SandboxRuntimeSdk for LocalProcessSandboxRuntime {
         tokio::fs::remove_dir_all(&session.sandbox.state_dir)
             .await
             .map_err(|err| Error::io_path(&session.sandbox.state_dir, err))
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<SandboxId>> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .values()
+            .map(|session| Ok(session.sandbox.id.clone()))
+            .collect()
+    }
+
+    async fn session_running(&self, id: &SandboxId) -> Result<bool> {
+        Ok(self.sessions.lock().await.contains_key(id.as_str()))
     }
 }
 
@@ -1133,24 +1375,33 @@ async fn handle_forward_connection(stream: TcpStream, conn_dir: PathBuf) {
     let _ = tokio::fs::File::create(&guest_to_host).await;
     let _ = make_world_writable_file_async(host_to_guest.clone()).await;
     let _ = make_world_writable_file_async(guest_to_host.clone()).await;
+    // Disable Nagle on the client-facing socket. The forwarded streams are
+    // interactive (e.g. VNC), where coalescing small writes adds tens of ms of
+    // latency for no benefit.
+    let _ = stream.set_nodelay(true);
     let (mut reader, mut writer) = stream.into_split();
 
     let upload_path = host_to_guest.clone();
     let upload_eof = host_eof.clone();
     let upload = tokio::spawn(async move {
-        let mut buffer = [0u8; 8192];
+        // Open the relay file once and reuse the handle. Re-opening per chunk
+        // costs a virtio-fs metadata round-trip on every read, which throttles
+        // throughput for high-bandwidth streams. A larger buffer cuts the
+        // number of append+flush round-trips for bursty framebuffer updates.
+        let Ok(mut file) = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&upload_path)
+            .await
+        else {
+            let _ = tokio::fs::write(upload_eof, b"").await;
+            return;
+        };
+        let mut buffer = vec![0u8; 65536];
         loop {
             match reader.read(&mut buffer).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    let Ok(mut file) = tokio::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&upload_path)
-                        .await
-                    else {
-                        break;
-                    };
                     if file.write_all(&buffer[..n]).await.is_err() {
                         break;
                     }
@@ -1171,6 +1422,7 @@ async fn handle_forward_connection(stream: TcpStream, conn_dir: PathBuf) {
                         break;
                     }
                     let _ = writer.flush().await;
+                    continue;
                 }
                 Ok(_) => {}
                 Err(_) => break,
@@ -1202,6 +1454,96 @@ async fn read_new_bytes_async(
     file.read_to_end(&mut bytes).await?;
     *offset += bytes.len() as u64;
     Ok(bytes)
+}
+
+/// Read the gvproxy control socket + guest IP a running session advertises in
+/// `runtime-control/network.json`. Only the gvproxy backend writes this file, so
+/// its absence simply means "no native fast path; use the relay." Returns None
+/// when the file is missing, unparseable, or the socket no longer exists.
+async fn read_network_discovery(control_dir: &std::path::Path) -> Option<(PathBuf, String)> {
+    let body = tokio::fs::read_to_string(control_dir.join("network.json"))
+        .await
+        .ok()?;
+    let api_socket = PathBuf::from(json_string_field(&body, "gvproxy_api_socket")?);
+    let guest_ip =
+        json_string_field(&body, "guest_ip").unwrap_or_else(|| "192.168.127.2".to_string());
+    if !tokio::fs::try_exists(&api_socket).await.unwrap_or(false) {
+        return None;
+    }
+    Some((api_socket, guest_ip))
+}
+
+/// Ask gvproxy to expose a fresh host port and route it into the guest. Returns
+/// the chosen host port on success, or None so the caller falls back to the
+/// relay. The host port is probed by binding `127.0.0.1:0` and releasing it
+/// before gvproxy rebinds — a small, local-only TOCTOU window.
+async fn try_native_forward(
+    api_socket: &std::path::Path,
+    guest_ip: &str,
+    guest_port: u16,
+) -> Option<u16> {
+    let local_port = {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).await.ok()?;
+        probe.local_addr().ok()?.port()
+    };
+    let body = format!(
+        "{{\"local\":\"127.0.0.1:{local_port}\",\"remote\":\"{guest_ip}:{guest_port}\",\"protocol\":\"tcp\"}}"
+    );
+    match gvproxy_api_post(api_socket, "/services/forwarder/expose", &body).await {
+        Ok(status) if (200..300).contains(&status) => Some(local_port),
+        _ => None,
+    }
+}
+
+/// POST a JSON body to gvproxy's HTTP control socket and return the response
+/// status code. Hand-rolled HTTP/1.0 over the unix socket so a single control
+/// request doesn't pull in an HTTP client dependency.
+async fn gvproxy_api_post(
+    api_socket: &std::path::Path,
+    path: &str,
+    body: &str,
+) -> std::io::Result<u16> {
+    let mut stream = tokio::net::UnixStream::connect(api_socket).await?;
+    let request = format!(
+        "POST {path} HTTP/1.0\r\nHost: gvproxy\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.flush().await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    let status = std::str::from_utf8(&response)
+        .ok()
+        .and_then(|text| text.lines().next())
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    Ok(status)
+}
+
+/// Extract a JSON string value by key from the hand-written discovery file.
+/// Handles the small escape set the writer emits; good enough for a file this
+/// code both produces and consumes (not a general JSON parser).
+fn json_string_field(json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let after_key = &json[json.find(&needle)? + needle.len()..];
+    let after_colon = &after_key[after_key.find(':')? + 1..];
+    let value_region = &after_colon[after_colon.find('"')? + 1..];
+    let mut out = String::new();
+    let mut chars = value_region.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                other => out.push(other),
+            },
+            '"' => return Some(out),
+            other => out.push(other),
+        }
+    }
+    None
 }
 
 async fn tail_response_lines(path: PathBuf, tx: mpsc::Sender<String>, status_path: PathBuf) {
@@ -1375,17 +1717,20 @@ def read_new(path, offset):
     except FileNotFoundError:
         return b"", offset
 
-def append(path, data):
-    with open(path, "ab") as f:
-        f.write(data)
-        f.flush()
-
 def connect_guest(deadline_seconds=10):
     deadline = time.time() + deadline_seconds
     last_error = None
     while time.time() < deadline:
         try:
-            return socket.create_connection(("127.0.0.1", guest_port), timeout=1)
+            sock = socket.create_connection(("127.0.0.1", guest_port), timeout=1)
+            sock.settimeout(None)
+            # Disable Nagle: the forwarded protocol (e.g. VNC) is interactive,
+            # and coalescing small writes adds latency for no gain.
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+            return sock
         except OSError as exc:
             last_error = exc
             time.sleep(0.05)
@@ -1412,23 +1757,30 @@ def handle(conn_dir):
                 data, offset = read_new(h2g, offset)
                 if data:
                     sock.sendall(data)
+                    continue
                 if host_eof.exists():
                     try:
                         sock.shutdown(socket.SHUT_WR)
                     except OSError:
                         pass
                     return
-                time.sleep(0.01)
+                time.sleep(0.001)
         finally:
             stop.set()
 
     def to_host():
+        # Keep the relay file open for the connection's lifetime instead of
+        # re-opening per chunk (each open is a virtio-fs round-trip), and read
+        # in larger chunks to cut the number of append+flush cycles for bursty
+        # framebuffer traffic.
         try:
-            while True:
-                data = sock.recv(8192)
-                if not data:
-                    return
-                append(g2h, data)
+            with open(g2h, "ab") as out:
+                while True:
+                    data = sock.recv(65536)
+                    if not data:
+                        return
+                    out.write(data)
+                    out.flush()
         finally:
             try:
                 guest_eof.touch(exist_ok=True)
@@ -1448,8 +1800,15 @@ while True:
         if item.is_dir() and item.name not in seen:
             seen.add(item.name)
             threading.Thread(target=handle, args=(item,), daemon=True).start()
-    time.sleep(0.02)
+    time.sleep(0.005)
 "#
+}
+
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
 }
 
 /// Rewrite guest mount paths to their backing host paths within a command's
@@ -1766,6 +2125,35 @@ mod tests {
     use crate::config::{AgentImageRef, WorkspaceMount};
     use crate::runtime::SandboxManager;
 
+    #[test]
+    fn json_string_field_parses_discovery_file() {
+        // Matches the exact shape ManagedGvproxy::publish_discovery writes.
+        let body = "{\n  \"gvproxy_api_socket\": \"/private/tmp/tb-sandbox-gvproxy-1-2/gvproxy-api.sock\",\n  \"guest_ip\": \"192.168.127.2\"\n}\n";
+        assert_eq!(
+            json_string_field(body, "gvproxy_api_socket").as_deref(),
+            Some("/private/tmp/tb-sandbox-gvproxy-1-2/gvproxy-api.sock")
+        );
+        assert_eq!(
+            json_string_field(body, "guest_ip").as_deref(),
+            Some("192.168.127.2")
+        );
+        assert_eq!(json_string_field(body, "missing"), None);
+    }
+
+    #[test]
+    fn json_string_field_unescapes_quotes_and_backslashes() {
+        let body = "{ \"k\": \"a\\\"b\\\\c\" }";
+        assert_eq!(json_string_field(body, "k").as_deref(), Some("a\"b\\c"));
+    }
+
+    #[tokio::test]
+    async fn read_network_discovery_absent_returns_none() {
+        let dir = std::env::temp_dir().join(format!("tb-disc-{}", now_millis()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        assert!(read_network_discovery(&dir).await.is_none());
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
     #[tokio::test]
     async fn local_process_runtime_exec_streams_and_reports_exit() {
         let root = test_root("local_process_runtime_exec_streams_and_reports_exit");
@@ -1820,6 +2208,77 @@ mod tests {
             .unwrap();
         let status = process.exit.await.unwrap().unwrap();
         assert!(!status.success);
+    }
+
+    #[tokio::test]
+    async fn api_contract_conformance_local_process_runtime() {
+        let root = test_root("api_contract_conformance_local_process_runtime");
+        let runtime = LocalProcessSandboxRuntime::new(&root);
+        let workspace = root.join("workspace");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+
+        let mut config = SandboxConfig::new(AgentImageRef::new(root.join("image")));
+        config.name = Some("contract-test".to_string());
+        config.workspace_mounts.push(WorkspaceMount {
+            tag: "workspace".to_string(),
+            host_path: workspace.clone(),
+            guest_path: "/workspace".to_string(),
+            read_only: false,
+        });
+
+        let sandbox = runtime.create_session(config).await.unwrap();
+        assert_eq!(sandbox.id.as_str(), "contract-test");
+        assert!(runtime.reopen_session(&sandbox.id).await.is_ok());
+        runtime.start_session(&sandbox.id).await.unwrap();
+
+        let mounts = runtime.inspect_mounts(&sandbox.id).await.unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].guest_path, "/workspace");
+        assert!(!mounts[0].read_only);
+
+        let process = runtime
+            .exec(
+                &sandbox.id,
+                GuestCommand::new([
+                    "/bin/sh",
+                    "-c",
+                    "printf 'contract-out\\n'; printf 'contract-err\\n' >&2; \
+                     printf 'file-ok\\n' > contract.txt; cat contract.txt",
+                ])
+                .cwd(workspace.display().to_string()),
+            )
+            .await
+            .unwrap();
+        let (stdout, stderr, status) = collect_process(process).await;
+        assert!(status.success);
+        assert_eq!(status.code, Some(0));
+        assert_eq!(stdout, vec!["contract-out", "file-ok"]);
+        assert_eq!(stderr, vec!["contract-err"]);
+        assert_eq!(
+            tokio::fs::read_to_string(workspace.join("contract.txt"))
+                .await
+                .unwrap(),
+            "file-ok\n"
+        );
+
+        let cancelled = runtime
+            .exec(&sandbox.id, GuestCommand::new(["/bin/sh", "-c", "sleep 5"]))
+            .await
+            .unwrap();
+        let cancelled_id = cancelled.id.clone();
+        runtime
+            .cancel_process(&sandbox.id, &cancelled_id)
+            .await
+            .unwrap();
+        let cancelled_status = cancelled.exit.await.unwrap().unwrap();
+        assert!(!cancelled_status.success);
+
+        runtime.stop_session(&sandbox.id).await.unwrap();
+        runtime.delete_session(&sandbox.id).await.unwrap();
+        assert!(matches!(
+            runtime.reopen_session(&sandbox.id).await,
+            Err(Error::NotFound(_))
+        ));
     }
 
     #[tokio::test]
@@ -2454,6 +2913,36 @@ eval "$INITIAL_COMMAND"
             std::env::temp_dir().join(format!("tb-sandbox-sdk-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         root
+    }
+
+    async fn collect_process(
+        mut process: GuestProcess,
+    ) -> (Vec<String>, Vec<String>, GuestExitStatus) {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let mut exit = process.exit;
+        let mut status = None;
+        loop {
+            tokio::select! {
+                line = process.stdout.recv(), if stdout_open => match line {
+                    Some(line) => stdout.push(line),
+                    None => stdout_open = false,
+                },
+                line = process.stderr.recv(), if stderr_open => match line {
+                    Some(line) => stderr.push(line),
+                    None => stderr_open = false,
+                },
+                result = &mut exit, if status.is_none() => {
+                    status = Some(result.unwrap().unwrap());
+                }
+            }
+            if !stdout_open && !stderr_open && status.is_some() {
+                break;
+            }
+        }
+        (stdout, stderr, status.unwrap())
     }
 
     fn make_executable(path: &std::path::Path) {

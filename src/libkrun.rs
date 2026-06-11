@@ -22,6 +22,11 @@ pub struct LaunchConfig<'a> {
     /// Unix socket the VMM should serve for runtime resize commands. Present
     /// only when runtime resizing is enabled.
     pub control_socket: Option<&'a Path>,
+    /// Guest vsock ports to bridge to host unix sockets: `(guest_port,
+    /// host_socket_path)`. Emitted as `--vsock-port PORT=PATH`. Used for the
+    /// in-guest `agent-sandbox-daemon` control channel; empty for boots that
+    /// don't need it.
+    pub vsock_ports: &'a [(u32, PathBuf)],
     /// virtio-fs DAX window size in bytes (0 = disabled).
     pub virtiofs_dax_size: u64,
     pub workspace_mounts: &'a [WorkspaceMount],
@@ -45,7 +50,7 @@ pub struct LaunchConfig<'a> {
 }
 
 pub fn launch(config: LaunchConfig<'_>) -> Result<ExitStatus> {
-    let launcher = find_os_mode_launcher()?;
+    let launcher = find_runner_launcher()?;
     let mut command = launch_command_with_launcher(config, &launcher)?;
     command
         .stdin(Stdio::inherit())
@@ -63,25 +68,27 @@ pub fn launch(config: LaunchConfig<'_>) -> Result<ExitStatus> {
 }
 
 pub fn launch_command(config: LaunchConfig<'_>) -> Result<Command> {
-    let launcher = find_os_mode_launcher()?;
+    let launcher = find_runner_launcher()?;
     launch_command_with_launcher(config, &launcher)
 }
 
 fn launch_command_with_launcher(config: LaunchConfig<'_>, launcher: &Path) -> Result<Command> {
     let mut command = Command::new(&launcher);
-    if let Some(dylib_path) = local_libkrun_dylib_path()? {
-        command.env(
-            "DYLD_LIBRARY_PATH",
-            prepend_env_path("DYLD_LIBRARY_PATH", &dylib_path),
-        );
+    if is_legacy_os_mode_launcher(launcher) {
+        if let Some(dylib_path) = local_libkrun_dylib_path()? {
+            command.env(
+                "DYLD_LIBRARY_PATH",
+                prepend_env_path("DYLD_LIBRARY_PATH", &dylib_path),
+            );
+        }
     }
 
     // Phase 3 (memory snapshot restore) path. When `restore_from` is set we
     // pass `--restore PATH` and the matching `--root-disk` (libkrun's
     // restore wires the disk into the restored virtio-blk). The kernel /
     // initramfs / boot config args become inert under restore so we omit
-    // them — this keeps the os_mode launcher's mutually-exclusive arg
-    // contract clean once it lands the flag.
+    // them because the runner treats restore as mutually exclusive with
+    // cold-boot kernel configuration.
     if let Some(snapshot_path) = config.restore_from {
         command
             .arg("--restore")
@@ -157,6 +164,14 @@ fn append_common_launcher_args(command: &mut Command, config: &LaunchConfig<'_>)
                 .arg(control_socket);
         }
     }
+    // Bridge guest vsock ports to host unix sockets (agent-sandbox-daemon
+    // control channel). The host connects to PATH; libkrun routes it to the
+    // guest daemon listening on the vsock port.
+    for (port, path) in config.vsock_ports {
+        command
+            .arg("--vsock-port")
+            .arg(format!("{}={}", port, path.display()));
+    }
     // Open a virtio-fs DAX window so shared read-only mounts are served from the
     // host page cache (shared across VMs) instead of copied per-guest.
     if config.virtiofs_dax_size > 0 {
@@ -206,7 +221,7 @@ fn append_common_launcher_args(command: &mut Command, config: &LaunchConfig<'_>)
 
     if !matches!(config.log_level, LogLevel::Error) {
         eprintln!(
-            "note: log level {:?} is recorded by tb-sandbox but examples/os_mode currently sets libkrun logs to error",
+            "note: log level {:?} is recorded by tb-sandbox but tb-sandbox-runner currently sets libkrun logs to error",
             config.log_level
         );
     }
@@ -237,7 +252,20 @@ fn shell_kernel_cmdline(image_cmdline: Option<&str>) -> String {
     }
 }
 
-fn find_os_mode_launcher() -> Result<PathBuf> {
+fn find_runner_launcher() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("TB_SANDBOX_RUNNER") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            ensure_runner_signed(&path);
+            return Ok(path);
+        }
+        return Err(Error::NotFound(format!(
+            "TB_SANDBOX_RUNNER points to {}, but it is not a file",
+            path.display()
+        )));
+    }
+
+    // One-release compatibility escape hatch for the previous C launcher.
     if let Some(path) = env::var_os("TB_SANDBOX_OS_MODE") {
         let path = PathBuf::from(path);
         if path.is_file() {
@@ -249,19 +277,183 @@ fn find_os_mode_launcher() -> Result<PathBuf> {
         )));
     }
 
-    let repo_relative = PathBuf::from("../thousandbirds-libkrun/examples/os_mode");
-    if repo_relative.is_file() {
-        return Ok(repo_relative);
-    }
-    let crate_relative =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../thousandbirds-libkrun/examples/os_mode");
-    if crate_relative.is_file() {
-        return Ok(crate_relative);
+    // Cargo-built runner: this is the primary integration path. It links the
+    // libkrun Rust crate directly and preserves the child-process boundary the
+    // runtime uses for status and cancellation.
+    for dir in bundled_dirs() {
+        let candidate = dir.join("tb-sandbox-runner");
+        if candidate.is_file() {
+            ensure_runner_signed(&candidate);
+            return Ok(candidate);
+        }
     }
 
     Err(Error::NotFound(
-        "libkrun os_mode launcher not found; build ../thousandbirds-libkrun/examples/os_mode or set TB_SANDBOX_OS_MODE".to_string(),
+        "tb-sandbox-runner not found; run `make setup`, or set TB_SANDBOX_RUNNER. For the legacy C launcher, set TB_SANDBOX_OS_MODE".to_string(),
     ))
+}
+
+/// Ensure the cargo-built runner carries the `com.apple.security.hypervisor`
+/// entitlement it needs to call Hypervisor.framework.
+///
+/// Why this exists: `cargo build` / `cargo test` produce an UNSIGNED
+/// `tb-sandbox-runner` (no entitlement). Booting with it fails deep inside
+/// libkrun as `VmSetup(VmCreate)` / `krun_start_enter: Invalid argument
+/// (os error 22)` — an opaque error that looks like a libkrun bug but is just a
+/// missing entitlement. Rather than make every developer remember to re-sign
+/// after each build, we self-heal here: if the binary lacks the entitlement we
+/// ad-hoc re-sign it in place (exactly what `scripts/setup-local.sh` does).
+///
+/// Safety / scope:
+/// - macOS only; a no-op elsewhere.
+/// - Only touches binaries we know are locally built/installed by Cargo: a path
+///   under `target/{debug,release}` (cargo build) or under `$CARGO_HOME/bin`
+///   (`cargo install`, default `~/.cargo/bin`). Notarized/Homebrew releases live
+///   elsewhere (e.g. `/opt/homebrew/bin`, `/Applications`) AND already carry the
+///   entitlement, so they are never inspected or modified — zero overhead and no
+///   risk of clobbering a Developer ID signature.
+/// - Best-effort: if signing fails, boot proceeds and surfaces the original
+///   clear error.
+#[cfg(target_os = "macos")]
+fn ensure_runner_signed(path: &Path) {
+    if !is_self_signable_location(path) || runner_has_hypervisor_entitlement(path) {
+        return;
+    }
+    let Some(entitlements) = write_hypervisor_entitlements_plist() else {
+        return;
+    };
+    let status = Command::new("codesign")
+        .arg("--entitlements")
+        .arg(&entitlements)
+        .arg("--force")
+        .arg("-s")
+        .arg("-")
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = std::fs::remove_file(&entitlements);
+    if matches!(status, Ok(s) if s.success()) {
+        eprintln!(
+            "tb-sandbox: re-signed {} with the hypervisor entitlement \
+             (cargo build had stripped it)",
+            path.display()
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_runner_signed(_path: &Path) {}
+
+/// True when `path` is a locally Cargo-produced binary we may self-sign: a build
+/// output under `.../target/{debug,release}/`, or a `cargo install` output under
+/// `$CARGO_HOME/bin` (default `~/.cargo/bin`). Never an installed system release.
+#[cfg(target_os = "macos")]
+fn is_self_signable_location(path: &Path) -> bool {
+    // cargo build: .../target/{debug,release}/...
+    let mut saw_target = false;
+    for component in path.components() {
+        let part = component.as_os_str().to_string_lossy();
+        if saw_target && (part == "debug" || part == "release") {
+            return true;
+        }
+        saw_target = part == "target";
+    }
+
+    // cargo install: $CARGO_HOME/bin/... (default ~/.cargo/bin). Compare both
+    // raw and canonicalized, since current_exe() may resolve symlinks (e.g. a
+    // home dir on a symlinked volume) while the candidate dirs are not resolved.
+    if let Some(parent) = path.parent() {
+        let parent_canon = std::fs::canonicalize(parent).ok();
+        for dir in cargo_install_bin_dirs() {
+            if parent == dir {
+                return true;
+            }
+            if let Some(ref pc) = parent_canon {
+                if std::fs::canonicalize(&dir).ok().as_ref() == Some(pc) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Candidate `cargo install` bin directories: `$CARGO_HOME/bin` if set, plus the
+/// default `~/.cargo/bin`.
+#[cfg(target_os = "macos")]
+fn cargo_install_bin_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(cargo_home) = env::var_os("CARGO_HOME") {
+        dirs.push(PathBuf::from(cargo_home).join("bin"));
+    }
+    if let Some(home) = env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".cargo").join("bin"));
+    }
+    dirs
+}
+
+#[cfg(target_os = "macos")]
+fn runner_has_hypervisor_entitlement(path: &Path) -> bool {
+    // `codesign -d --entitlements -` dumps entitlements (to stdout on modern
+    // macOS, with some chatter on stderr); an unsigned binary yields neither.
+    match Command::new("codesign")
+        .arg("-d")
+        .arg("--entitlements")
+        .arg("-")
+        .arg(path)
+        .output()
+    {
+        Ok(output) => {
+            let needle = "com.apple.security.hypervisor";
+            String::from_utf8_lossy(&output.stdout).contains(needle)
+                || String::from_utf8_lossy(&output.stderr).contains(needle)
+        }
+        Err(_) => false,
+    }
+}
+
+/// Write the minimal hypervisor-only entitlements plist (matching
+/// `packaging/os_mode.entitlements`) to a temp file. Returns its path, or None
+/// if it could not be written.
+#[cfg(target_os = "macos")]
+fn write_hypervisor_entitlements_plist() -> Option<PathBuf> {
+    const PLIST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+<plist version=\"1.0\">\n\
+<dict>\n\
+\t<key>com.apple.security.hypervisor</key>\n\
+\t<true/>\n\
+</dict>\n\
+</plist>\n";
+    let path = env::temp_dir().join(format!(
+        "tb-sandbox-hv-entitlements-{}.plist",
+        std::process::id()
+    ));
+    std::fs::write(&path, PLIST).ok()?;
+    Some(path)
+}
+
+/// Directories to search for the bundled runner in a packaged install, resolved
+/// relative to the running `tb-sandbox` executable. Covers a flat layout
+/// (artifacts next to the binary) and a Homebrew-style `bin/` + `libexec/`
+/// split.
+fn bundled_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(exe) = env::current_exe() {
+        if let Some(bin) = exe.parent() {
+            dirs.push(bin.to_path_buf());
+            dirs.push(bin.join("../libexec/tb-sandbox"));
+        }
+    }
+    dirs
+}
+
+fn is_legacy_os_mode_launcher(launcher: &Path) -> bool {
+    launcher
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "os_mode")
 }
 
 fn local_libkrun_dylib_path() -> Result<Option<PathBuf>> {
@@ -272,14 +464,22 @@ fn local_libkrun_dylib_path() -> Result<Option<PathBuf>> {
         return Ok(Some(PathBuf::from(path)));
     }
 
-    for dir in [
-        PathBuf::from("../thousandbirds-libkrun/target/debug"),
-        PathBuf::from("../thousandbirds-libkrun/target/release"),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../thousandbirds-libkrun/target/debug"),
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../thousandbirds-libkrun/target/release"),
-        PathBuf::from("/opt/homebrew/lib"),
-        PathBuf::from("/usr/local/lib"),
-    ] {
+    // Legacy C launcher support only. Prefer release paths before debug paths
+    // because local os_mode is usually linked against release libkrun;
+    // preferring debug first can accidentally pick up a stale/incomplete dylib.
+    let search: Vec<PathBuf> = bundled_dirs()
+        .into_iter()
+        .chain([
+            PathBuf::from("../thousandbirds-libkrun/target/release"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../thousandbirds-libkrun/target/release"),
+            PathBuf::from("../thousandbirds-libkrun/target/debug"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../thousandbirds-libkrun/target/debug"),
+            PathBuf::from("/opt/homebrew/lib"),
+            PathBuf::from("/usr/local/lib"),
+        ])
+        .collect();
+    for dir in search {
         if dir.join("libkrun.1.dylib").is_file() {
             return Ok(Some(dir));
         }

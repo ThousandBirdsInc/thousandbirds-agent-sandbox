@@ -4,14 +4,34 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.77.0"
 license = "Apache-2.0"
+default-run = "tb-sandbox"
+
+[workspace]
+members = ["crates/agent-sandbox-protocol", "crates/agent-sandbox-daemon"]
 
 [dependencies]
 async-trait = "0.1"
+agent-sandbox-protocol = { path = "crates/agent-sandbox-protocol" }
+# Thousand Birds fork. The package is still named `libkrun` upstream, but this
+# must resolve to the local fork checkout, not crates.io or containers/libkrun.
+thousandbirds_libkrun = { package = "libkrun", path = "../thousandbirds-libkrun/src/libkrun", features = ["blk", "net"] }
 libc = "0.2"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
 webpki-roots = "1"
+# Browser DOM-diff streaming (`browser stream`): a WebSocket client to drive
+# CDP, a WebSocket server to feed the viewer, and JSON for the CDP protocol.
+# Default features (no TLS) already include `connect`+`handshake`; we only ever
+# speak plain ws:// (CDP and a localhost viewer), so no TLS stack is pulled in.
+tokio-tungstenite = "0.24"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde_json = "1"
+
+[dev-dependencies]
+# In-process daemon server used to drive the host DaemonClient through real
+# socket I/O in conformance tests (no VM required).
+agent-sandbox-daemon = { path = "crates/agent-sandbox-daemon" }
 
 [lib]
 name = "thousandbirds_agent_sandbox"
@@ -20,3 +40,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "tb-sandbox"
 path = "src/main.rs"
+
+[[bin]]
+name = "tb-sandbox-runner"
+path = "src/bin/tb-sandbox-runner.rs"

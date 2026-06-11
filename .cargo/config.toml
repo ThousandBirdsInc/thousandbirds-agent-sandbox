@@ -1,0 +1,2 @@
+[env]
+CC_LINUX = { value = "scripts/cc-linux.sh", relative = true }

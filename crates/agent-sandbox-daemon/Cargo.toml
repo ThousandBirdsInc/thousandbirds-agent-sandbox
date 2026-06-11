@@ -1,0 +1,21 @@
+[package]
+name = "agent-sandbox-daemon"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.0"
+license = "Apache-2.0"
+description = "In-guest control daemon for tb-sandbox: exec, PTY, filesystem, and git over a multiplexed vsock connection."
+
+[lib]
+name = "agent_sandbox_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent-sandbox-daemon"
+path = "src/main.rs"
+
+[dependencies]
+agent-sandbox-protocol = { path = "../agent-sandbox-protocol" }
+serde_json = "1"
+libc = "0.2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "process", "sync", "time", "fs"] }

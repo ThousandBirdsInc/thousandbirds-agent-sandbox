@@ -1,0 +1,21 @@
+[Unit]
+Description=tb-sandbox in-guest control daemon (exec, PTY, fs, git over vsock)
+DefaultDependencies=no
+After=local-fs.target systemd-tmpfiles-setup.service
+Wants=local-fs.target
+# Bring the daemon up before the interactive shell / legacy command server so
+# the host SDK can reach it as soon as the session is considered running.
+Before=agent-sandbox-shell.service
+
+[Service]
+Type=simple
+# Listen on the agent-sandbox-protocol default vsock port. libkrun bridges this
+# to the per-sandbox control.vsock unix socket on the host.
+ExecStart=/usr/local/bin/agent-sandbox-daemon --vsock-port 1024
+Restart=on-failure
+RestartSec=1
+# No-op cleanly when the guest kernel lacks vsock support rather than thrashing.
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

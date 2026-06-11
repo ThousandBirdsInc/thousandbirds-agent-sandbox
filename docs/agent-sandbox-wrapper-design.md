@@ -703,18 +703,23 @@ Optional host integration tests:
 10. Refactor `tb-sandbox` commands to consume the SDK surface rather than
    owning separate orchestration logic.
 
-## Open Questions
+## Decisions From Earlier Open Questions
 
-- Should the first agent image be built in this repository, or should it remain
-  entirely owned by `../thousandbirds-libkrun` examples?
-- What should the canonical Codex credential paths be for the target installed
-  Codex CLI version?
-- Should credentials be imported on every boot, or only when the staged
-  credential manifest changes?
-- Do we need a host-to-guest control channel beyond serial for terminal resize,
-  reattach, and structured exit status?
-- Should networking be enabled by default for agent workflows, or require an
-  explicit `--network` flag?
+- Agent images are built from this repository's `images/` and `guest/` inputs
+  via `scripts/build-agent-image.sh`, while the low-level rootfs builder remains
+  in `../thousandbirds-libkrun`.
+- Built-in Codex credential discovery is intentionally small:
+  `~/.codex/auth.json`, `~/.codex/config.toml`, and the matching
+  `~/.config/codex/*` paths, plus portable auth through `OPENAI_API_KEY`.
+- Credentials are imported on every boot from the staged manifest. The staging
+  directory is sandbox-local and does not reread host credentials after create,
+  snapshot, restore, or fork.
+- The current structured control path is the `agent-control` virtio-fs mount
+  used by `SandboxManagerSdk`; the planned vsock transport below is the next
+  transport upgrade, not a public API shape change.
+- Networking requires an explicit guest network backend (`--passt-socket`,
+  `--gvproxy`, or `--gvproxy-socket`). The host HTTP proxy can be enabled by
+  default, but without a backend the guest has no route to it.
 
 ## Planned: vsock Host↔Guest Control Channel
 

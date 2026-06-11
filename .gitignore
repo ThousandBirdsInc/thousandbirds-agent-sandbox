@@ -23,3 +23,12 @@
 # Rust tooling scratch files.
 *.rs.bk
 *.pdb
+
+# macOS release staging (scripts/release-macos.sh)
+/dist/
+
+# Claude Code local state.
+.claude/
+
+# Scratch test artifacts.
+/fs-roundtrip.txt

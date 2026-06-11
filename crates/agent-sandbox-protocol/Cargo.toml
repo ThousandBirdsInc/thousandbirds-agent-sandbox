@@ -1,0 +1,15 @@
+[package]
+name = "agent-sandbox-protocol"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.0"
+license = "Apache-2.0"
+description = "Wire protocol shared by the tb-sandbox host SDK and the in-guest agent-sandbox-daemon."
+
+[lib]
+name = "agent_sandbox_protocol"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["io-util"] }

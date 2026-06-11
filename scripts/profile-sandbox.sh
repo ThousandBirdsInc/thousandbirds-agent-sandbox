@@ -54,7 +54,7 @@ Environment:
   KEEP_LOGS=1                  Keep per-iteration logs under a temp dir and print the path
   SYSTEMD_ANALYZE=1            Dump 'systemd-analyze blame' from the guest on iteration 1
 
-  Any TB_SANDBOX_* the wrapper honors (e.g. TB_SANDBOX_OS_MODE, TB_SANDBOX_GVPROXY)
+  Any TB_SANDBOX_* the wrapper honors (e.g. TB_SANDBOX_RUNNER, TB_SANDBOX_GVPROXY)
   is passed through to the child process.
 EOF
 }
@@ -120,14 +120,14 @@ if [ -n "$RESOURCE_CSV" ] && [ ! -f "$RESOURCE_CSV" ]; then
   printf 'iteration,elapsed_ms,rss_kib,cpu_pct\n' > "$RESOURCE_CSV"
 fi
 
-# find_vm_pid <root_pid> prints the pid of the os_mode VM process spawned as a
+# find_vm_pid <root_pid> prints the pid of the VM runner process spawned as a
 # descendant of the wrapper, or nothing if it is not up yet.
 find_vm_pid() {
   root=$1
   for child in $(pgrep -P "$root" 2>/dev/null || true); do
     cmd=$(ps -o command= -p "$child" 2>/dev/null || true)
     case "$cmd" in
-      *os_mode*) printf '%s\n' "$child"; return 0 ;;
+      *tb-sandbox-runner*|*os_mode*) printf '%s\n' "$child"; return 0 ;;
     esac
     # Recurse one level: cargo/run wrappers can interpose a process.
     sub=$(find_vm_pid "$child" || true)
@@ -276,7 +276,7 @@ run_iteration() {
   printf '\n[iteration %s]\n' "$iter"
   printf '  host create:          %6s ms\n' "$create_ms"
   printf '  host prelaunch:       %6s ms  (config + backend/proxy setup)\n' "$host_ms"
-  printf '  pre-kernel VMM init:  %6s ms  (os_mode + libkrun VM create, before kernel)\n' "$prekernel_ms"
+  printf '  pre-kernel VMM init:  %6s ms  (runner + libkrun VM create, before kernel)\n' "$prekernel_ms"
   printf '  guest kernel->ready:  %6s ms  (kernel + systemd + shell service + login)\n' "$guest_ms"
   if [ -n "$g_shell" ]; then
     gs=$(awk -v s="$g_shell" 'BEGIN{printf "%d", s*1000}')

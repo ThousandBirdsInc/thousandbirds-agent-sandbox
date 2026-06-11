@@ -18,29 +18,37 @@
 # already gone.
 #
 # Usage:
-#   agent-sandbox-browser start [--headless|--headed] [--cdp-port N] [--vnc-port N] [--profile DIR]
+#   agent-sandbox-browser start [--headless|--headed] [--cdp-port N] [--vnc-port N] [--vnc-geometry WxHxD] [--vnc-password PASSWORD] [--profile DIR]
 #   agent-sandbox-browser status
 #   agent-sandbox-browser stop
 
 set -u
 
 PROFILE_BASE="${AGENT_SANDBOX_BROWSER_PROFILE:-/home/agent/.cache/agent-sandbox-browser}"
-STATE_DIR="${AGENT_SANDBOX_BROWSER_STATE:-/run/agent-sandbox-browser}"
-LOG_DIR="${AGENT_SANDBOX_BROWSER_LOG_DIR:-/var/log}"
+STATE_DIR="${AGENT_SANDBOX_BROWSER_STATE:-/tmp/agent-sandbox-browser}"
+LOG_DIR="${AGENT_SANDBOX_BROWSER_LOG_DIR:-$PROFILE_BASE/logs}"
 DEFAULT_CDP_PORT=9222
 DEFAULT_VNC_PORT=5900
 DEFAULT_DISPLAY=:99
+DEFAULT_VNC_GEOMETRY="${AGENT_SANDBOX_BROWSER_VNC_GEOMETRY:-1024x768x16}"
+DEFAULT_VNC_PASSWORD="${AGENT_SANDBOX_BROWSER_VNC_PASSWORD:-sandbox}"
 
 CHROMIUM_BIN="$(command -v chromium 2>/dev/null || command -v chromium-browser 2>/dev/null || true)"
 XVFB_BIN="$(command -v Xvfb 2>/dev/null || true)"
 X11VNC_BIN="$(command -v x11vnc 2>/dev/null || true)"
 WM_BIN="$(command -v fluxbox 2>/dev/null || command -v openbox 2>/dev/null || true)"
 
-mkdir -p "$STATE_DIR" 2>/dev/null || true
-mkdir -p "$PROFILE_BASE" 2>/dev/null || true
-
 log() {
   printf 'agent-sandbox-browser: %s\n' "$*" >&2
+}
+
+ensure_dirs() {
+  for dir in "$STATE_DIR" "$PROFILE_BASE" "$LOG_DIR"; do
+    if ! mkdir -p "$dir" 2>/dev/null; then
+      log "cannot create writable directory: $dir"
+      exit 73
+    fi
+  done
 }
 
 write_pid() {
@@ -64,11 +72,14 @@ write_kv() {
 }
 
 cmd_status() {
+  ensure_dirs
   cdp_pid=$(read_pid chromium || echo "")
   vnc_pid=$(read_pid x11vnc || echo "")
   xvfb_pid=$(read_pid xvfb || echo "")
+  wm_pid=$(read_pid wm || echo "")
   cdp_port="$(cat "$STATE_DIR/cdp_port" 2>/dev/null || echo "")"
   vnc_port="$(cat "$STATE_DIR/vnc_port" 2>/dev/null || echo "")"
+  vnc_password="$(cat "$STATE_DIR/vnc_password" 2>/dev/null || echo "")"
   mode="$(cat "$STATE_DIR/mode" 2>/dev/null || echo "")"
   alive=0
   pid_alive "$cdp_pid" && alive=1
@@ -80,20 +91,24 @@ cmd_status() {
     [ -n "$cdp_port" ] && printf 'cdp_port=%s\n' "$cdp_port"
     [ -n "$cdp_port" ] && printf 'cdp_url=http://127.0.0.1:%s\n' "$cdp_port"
     if [ "$mode" = "headed" ] && pid_alive "$vnc_pid"; then
+      pid_alive "$xvfb_pid" && printf 'xvfb_pid=%s\n' "$xvfb_pid"
+      pid_alive "$wm_pid" && printf 'wm_pid=%s\n' "$wm_pid"
       printf 'vnc_pid=%s\n' "$vnc_pid"
       [ -n "$vnc_port" ] && printf 'vnc_port=%s\n' "$vnc_port"
+      [ -n "$vnc_password" ] && printf 'vnc_password=%s\n' "$vnc_password"
     fi
     return 0
   fi
   printf 'status=stopped\n'
   # Reap stale pid files.
-  rm -f "$STATE_DIR/chromium.pid" "$STATE_DIR/x11vnc.pid" "$STATE_DIR/xvfb.pid" \
-        "$STATE_DIR/cdp_port" "$STATE_DIR/vnc_port" "$STATE_DIR/mode" 2>/dev/null || true
+  rm -f "$STATE_DIR/chromium.pid" "$STATE_DIR/x11vnc.pid" "$STATE_DIR/xvfb.pid" "$STATE_DIR/wm.pid" \
+        "$STATE_DIR/cdp_port" "$STATE_DIR/vnc_port" "$STATE_DIR/vnc_password" "$STATE_DIR/mode" 2>/dev/null || true
   return 0
 }
 
 cmd_stop() {
-  for proc in chromium x11vnc xvfb; do
+  ensure_dirs
+  for proc in chromium x11vnc wm xvfb; do
     pid=$(read_pid "$proc" || echo "")
     if pid_alive "$pid"; then
       kill "$pid" 2>/dev/null || true
@@ -109,11 +124,12 @@ cmd_stop() {
     fi
     rm -f "$STATE_DIR/$proc.pid" 2>/dev/null || true
   done
-  rm -f "$STATE_DIR/cdp_port" "$STATE_DIR/vnc_port" "$STATE_DIR/mode" 2>/dev/null || true
+  rm -f "$STATE_DIR/cdp_port" "$STATE_DIR/vnc_port" "$STATE_DIR/vnc_password" "$STATE_DIR/mode" 2>/dev/null || true
   log "stopped"
 }
 
 cmd_start() {
+  ensure_dirs
   if [ -z "$CHROMIUM_BIN" ]; then
     log "chromium is not installed; rebuild the agent image with the debian-bookworm-browser variant"
     exit 69
@@ -122,6 +138,8 @@ cmd_start() {
   mode="headless"
   cdp_port="$DEFAULT_CDP_PORT"
   vnc_port="$DEFAULT_VNC_PORT"
+  vnc_geometry="$DEFAULT_VNC_GEOMETRY"
+  vnc_password="$DEFAULT_VNC_PASSWORD"
   display="$DEFAULT_DISPLAY"
   profile="$PROFILE_BASE/default"
 
@@ -133,6 +151,10 @@ cmd_start() {
         cdp_port="${2:?--cdp-port requires a value}"; shift 2;;
       --vnc-port)
         vnc_port="${2:?--vnc-port requires a value}"; shift 2;;
+      --vnc-geometry)
+        vnc_geometry="${2:?--vnc-geometry requires a value}"; shift 2;;
+      --vnc-password)
+        vnc_password="${2:?--vnc-password requires a value}"; shift 2;;
       --profile)
         profile="${2:?--profile requires a value}"; shift 2;;
       *) log "unknown argument: $1"; exit 64;;
@@ -165,7 +187,7 @@ cmd_start() {
       log "headed mode requires Xvfb and x11vnc; rebuild the browser image with display support"
       exit 69
     fi
-    "$XVFB_BIN" "$display" -screen 0 1280x800x24 >/dev/null 2>&1 &
+    "$XVFB_BIN" "$display" -screen 0 "$vnc_geometry" >/dev/null 2>&1 &
     xvfb_pid=$!
     write_pid xvfb "$xvfb_pid"
     # Wait briefly for the X server socket.
@@ -174,18 +196,42 @@ cmd_start() {
       sleep 0.1
       i=$((i + 1))
     done
+    if [ ! -S "/tmp/.X11-unix/X${display#:}" ]; then
+      log "Xvfb did not create display socket for $display"
+      cmd_stop
+      exit 1
+    fi
 
     if [ -n "$WM_BIN" ]; then
       DISPLAY="$display" "$WM_BIN" >/dev/null 2>&1 &
+      write_pid wm "$!"
     fi
 
     # x11vnc serves the framebuffer on $vnc_port. -forever keeps it alive
     # after the first client disconnects; -shared allows multiple viewers.
+    # macOS Screen Sharing expects VNC auth, so use a local-only default
+    # password instead of -nopw.
+    #
+    # Performance flags:
+    #   -threads  handle input and framebuffer updates on separate threads so a
+    #             slow client read can't stall input processing (big perceived
+    #             responsiveness win over the file-relay transport).
+    #   -wait/-defer  poll/coalesce intervals (ms); 5ms keeps updates responsive.
+    #   xdamage is on by default when the display supports it; Xvfb provides the
+    #   DAMAGE extension, so most browser frames ship as small partial updates
+    #   rather than full-screen raws.
     "$X11VNC_BIN" -display "$display" \
       -rfbport "$vnc_port" -listen 0.0.0.0 \
-      -forever -shared -nopw -quiet >/dev/null 2>&1 &
+      -forever -shared -threads -wait 5 -defer 5 \
+      -passwd "$vnc_password" -quiet >/dev/null 2>&1 &
     vnc_pid=$!
     write_pid x11vnc "$vnc_pid"
+    sleep 0.2
+    if ! pid_alive "$vnc_pid"; then
+      log "x11vnc exited during startup"
+      cmd_stop
+      exit 1
+    fi
 
     DISPLAY="$display" "$CHROMIUM_BIN" $chromium_args \
       >"$LOG_DIR/agent-sandbox-browser.log" 2>&1 &
@@ -203,6 +249,7 @@ cmd_start() {
   write_pid chromium "$chromium_pid"
   printf '%s' "$cdp_port" > "$STATE_DIR/cdp_port"
   printf '%s' "$vnc_port" > "$STATE_DIR/vnc_port"
+  printf '%s' "$vnc_password" > "$STATE_DIR/vnc_password"
   printf '%s' "$mode" > "$STATE_DIR/mode"
 
   # Give Chromium a moment to bind its CDP port. We don't probe the TCP
