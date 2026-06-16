@@ -13,8 +13,12 @@ members = ["crates/agent-sandbox-protocol", "crates/agent-sandbox-daemon"]
 async-trait = "0.1"
 agent-sandbox-protocol = { path = "crates/agent-sandbox-protocol" }
 # Thousand Birds fork. The package is still named `libkrun` upstream, but this
-# must resolve to the local fork checkout, not crates.io or containers/libkrun.
-thousandbirds_libkrun = { package = "libkrun", path = "../thousandbirds-libkrun/src/libkrun", features = ["blk", "net"] }
+# must resolve to the fork, not crates.io or containers/libkrun. Referenced by
+# git (not path) so that consumers pulling this crate as a git dependency can
+# resolve libkrun too — the upstream `libkrun` name is taken on crates.io and
+# the fork is an unpublishable multi-crate FFI workspace. Local development of
+# this repo still builds the sibling checkout via the [patch] below.
+thousandbirds_libkrun = { package = "libkrun", git = "https://github.com/ThousandBirdsInc/thousandbirds-libkrun.git", rev = "3fe94d877fa41e9d265cc3d7e01790945a8baaf8", features = ["blk", "net"] }
 libc = "0.2"
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -44,3 +48,10 @@ path = "src/main.rs"
 [[bin]]
 name = "tb-sandbox-runner"
 path = "src/bin/tb-sandbox-runner.rs"
+
+# Local-development override: build the libkrun fork from the sibling checkout
+# instead of fetching the pinned git rev. Cargo applies [patch] only when this
+# repo is the build root, so crates that consume `thousandbirds-agent-sandbox`
+# as a git dependency are unaffected and still resolve libkrun from git.
+[patch."https://github.com/ThousandBirdsInc/thousandbirds-libkrun.git"]
+libkrun = { path = "../thousandbirds-libkrun/src/libkrun" }
