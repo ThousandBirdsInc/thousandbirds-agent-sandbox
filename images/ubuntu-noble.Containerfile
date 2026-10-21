@@ -3,6 +3,7 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV container=oci
 
+# Reject images whose system trust store predates the October 2026 eMudhra fix.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
@@ -38,6 +39,7 @@ RUN apt-get update \
         vim-tiny \
         wget \
         xz-utils \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816ubuntu0.24.04.1 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
